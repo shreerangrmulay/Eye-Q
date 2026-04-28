@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:http/http.dart' as http;
+
 import 'api_service.dart';
 
 class ExamScreen extends StatefulWidget {
@@ -17,30 +20,52 @@ class _ExamScreenState extends State<ExamScreen> {
   Timer? _captureTimer;
   final ApiService _apiService = ApiService();
 
-  bool _isCameraReady   = false;
+  bool _isCameraReady = false;
   String? _selectedOption;
 
-  // ── AI warning state ──────────────────────────────────────
-  bool   _isCheatingDetected = false;
-  String _aiMessage          = "";
+  bool _isCheatingDetected = false;
+  String _aiMessage = "";
 
-  // Prevent overlapping upload calls
   bool _isUploading = false;
+
+  // 🔥 SESSION ID (later make dynamic)
+  final String sessionId = "999";
 
   @override
   void initState() {
     super.initState();
+    _startSession();   // ✅ Start backend session
     _initializeCamera();
   }
 
-  // ── Camera initialisation ─────────────────────────────────
+  // ─────────────────────────────────────────────
+  // 🚀 START SESSION (NEW)
+  // ─────────────────────────────────────────────
+  Future<void> _startSession() async {
+    try {
+      await http.post(
+        Uri.parse("${ApiService.baseUrl}/session/start"),
+        headers: {"Content-Type": "application/json"},
+        body: jsonEncode({
+          "session_id": sessionId,
+          "student_id": "student_1"
+        }),
+      );
+    } catch (e) {
+      debugPrint("Session start error: $e");
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // CAMERA INIT
+  // ─────────────────────────────────────────────
   Future<void> _initializeCamera() async {
     try {
       final cameras = await availableCameras();
       if (cameras.isEmpty) return;
 
       final front = cameras.firstWhere(
-            (c) => c.lensDirection == CameraLensDirection.front,
+        (c) => c.lensDirection == CameraLensDirection.front,
         orElse: () => cameras.first,
       );
 
@@ -60,37 +85,39 @@ class _ExamScreenState extends State<ExamScreen> {
     }
   }
 
-  // ── Real-time AI proctoring ───────────────────────────────
-  // CHANGED: removed mock; now calls real backend every 2 s.
-  // Guard flag (_isUploading) ensures frames don't queue up if
-  // the server is slow.
+  // ─────────────────────────────────────────────
+  // AI PROCTORING LOOP
+  // ─────────────────────────────────────────────
   void _startProctoring() {
     _captureTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      // Skip if previous upload hasn't finished
       if (_isUploading) return;
 
       final ctrl = _controller;
       if (ctrl == null ||
           !ctrl.value.isInitialized ||
-          ctrl.value.isTakingPicture) return;
+          ctrl.value.isTakingPicture) {
+        return;
+      }
 
       _isUploading = true;
+
       try {
         final XFile image = await ctrl.takePicture();
 
-        // Send to backend → POST /proctor/upload-frame  (key: "file")
-        final Map<String, dynamic> result =
-        await _apiService.uploadFrame(File(image.path));
+        // 🔥 Send with session ID
+        final result = await _apiService.uploadFrame(
+          File(image.path),
+          sessionId,
+        );
 
-        // Clean up temp file after upload
         try {
           await File(image.path).delete();
         } catch (_) {}
 
         if (mounted) {
           setState(() {
-            _isCheatingDetected = result['cheating'] as bool? ?? false;
-            _aiMessage          = result['message']  as String? ?? "";
+            _isCheatingDetected = result['cheating'] ?? false;
+            _aiMessage = result['message'] ?? "";
           });
         }
       } catch (e) {
@@ -98,7 +125,7 @@ class _ExamScreenState extends State<ExamScreen> {
         if (mounted) {
           setState(() {
             _isCheatingDetected = false;
-            _aiMessage          = "Connection lost";
+            _aiMessage = "Connection lost";
           });
         }
       } finally {
@@ -107,7 +134,6 @@ class _ExamScreenState extends State<ExamScreen> {
     });
   }
 
-  // ── Lifecycle ─────────────────────────────────────────────
   @override
   void dispose() {
     _captureTimer?.cancel();
@@ -115,7 +141,9 @@ class _ExamScreenState extends State<ExamScreen> {
     super.dispose();
   }
 
-  // ── Build ─────────────────────────────────────────────────
+  // ─────────────────────────────────────────────
+  // UI
+  // ─────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -126,20 +154,15 @@ class _ExamScreenState extends State<ExamScreen> {
       ),
       body: Stack(
         children: [
-          // 1. Main exam content
           Padding(
             padding: const EdgeInsets.all(24.0),
             child: _buildQuestionUI(),
           ),
-
-          // 2. Camera overlay (top-right)
           Positioned(
             top: 10,
             right: 10,
             child: _buildCameraContainer(),
           ),
-
-          // 3. AI warning banner (top-centre) — only when cheating
           if (_isCheatingDetected)
             Positioned(
               top: 80,
@@ -152,14 +175,18 @@ class _ExamScreenState extends State<ExamScreen> {
     );
   }
 
-  // ── UI components (unchanged from original) ───────────────
+  // ─────────────────────────────────────────────
+  // WARNING BANNER
+  // ─────────────────────────────────────────────
   Widget _buildWarningBanner() {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.red.withOpacity(0.9),
+        color: Colors.red.withValues(alpha: 0.9),
         borderRadius: BorderRadius.circular(8),
-        boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+        boxShadow: const [
+          BoxShadow(color: Colors.black26, blurRadius: 4)
+        ],
       ),
       child: Row(
         children: [
@@ -179,6 +206,9 @@ class _ExamScreenState extends State<ExamScreen> {
     );
   }
 
+  // ─────────────────────────────────────────────
+  // CAMERA VIEW
+  // ─────────────────────────────────────────────
   Widget _buildCameraContainer() {
     return Container(
       width: 110,
@@ -210,39 +240,52 @@ class _ExamScreenState extends State<ExamScreen> {
       ),
       child: const Text(
         "59:52",
-        style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+        style: TextStyle(
+          color: Colors.red,
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }
 
+  // ─────────────────────────────────────────────
+  // QUESTION UI
+  // ─────────────────────────────────────────────
   Widget _buildQuestionUI() {
+    final options = [
+      "K-Means",
+      "Linear Regression",
+      "PCA",
+      "Association"
+    ];
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          "Question 1 of 20",
-          style: TextStyle(color: Colors.grey),
-        ),
+        const Text("Question 1 of 20",
+            style: TextStyle(color: Colors.grey)),
         const SizedBox(height: 10),
         const Text(
           "Which of the following is Supervised Learning?",
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 20),
+
         Expanded(
-          child: ListView(
-            children: ["K-Means", "Linear Regression", "PCA", "Association"]
-                .map(
-                  (opt) => RadioListTile<String>(
-                title: Text(opt),
-                value: opt,
-                groupValue: _selectedOption,
-                onChanged: (v) => setState(() => _selectedOption = v),
-              ),
-            )
-                .toList(),
+          child: RadioGroup<String>(
+            groupValue: _selectedOption,
+            onChanged: (v) => setState(() => _selectedOption = v),
+            child: ListView(
+              children: options.map((opt) {
+                return RadioListTile<String>(
+                  title: Text(opt),
+                  value: opt,
+                );
+              }).toList(),
+            ),
           ),
         ),
+
         SizedBox(
           width: double.infinity,
           height: 50,

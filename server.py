@@ -1,42 +1,29 @@
-"""
-FastAPI wrapper for the AI Proctoring backend.
-──────────────────────────────────────────────
-This file adds the HTTP layer Flutter talks to.
-Detection logic (test6.py) is NOT touched.
-
-Run with:
-    uvicorn server:app --host 0.0.0.0 --port 8000 --reload
-"""
-
-import tempfile
-import os
 import cv2
 import numpy as np
+import time
+from typing import Dict
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from ultralytics import YOLO
 import mediapipe as mp
 
-# ── Import ONLY the detection helpers from your existing test6.py ──
+# ── Import detection helpers ──
 from test6 import (
     CFG,
-    state,
-    SessionState,
     detect_objects,
     validate_phones,
     get_hand_boxes_simple,
     detect_phone_in_crop,
-    enhance_frame,
     resize_frame,
 )
 
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
 # APP SETUP
-# ═══════════════════════════════════════════════════════════════
-app = FastAPI(title="ProctorAI API", version="1.0.0")
+# ═══════════════════════════════════════════════
+app = FastAPI(title="ProctorAI API", version="2.0")
 
-# Allow Flutter (any origin) to reach this server
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,100 +31,174 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load models once at startup (expensive — do NOT put inside endpoint) ──
-print("[INFO] Loading YOLO model...")
+# ═══════════════════════════════════════════════
+# GLOBAL SESSION STORE
+# ═══════════════════════════════════════════════
+sessions: Dict[str, dict] = {}
+
+# ═══════════════════════════════════════════════
+# LOAD MODELS
+# ═══════════════════════════════════════════════
+print("[INFO] Loading YOLO...")
 yolo = YOLO("yolov8s.pt")
 
-print("[INFO] Initialising MediaPipe Hands...")
-mp_hands   = mp.solutions.hands
+print("[INFO] Loading MediaPipe Hands...")
+mp_hands = mp.solutions.hands
 hands_model = mp_hands.Hands(
-    static_image_mode=True,   # single-image mode for API requests
+    static_image_mode=True,
     max_num_hands=2,
     min_detection_confidence=0.4,
-    min_tracking_confidence=0.4,
 )
 
-print("[INFO] FastAPI server ready.")
+print("[INFO] Server Ready")
 
+# ═══════════════════════════════════════════════
+# MODELS
+# ═══════════════════════════════════════════════
+class SessionData(BaseModel):
+    session_id: str
+    student_id: str
 
-# ═══════════════════════════════════════════════════════════════
-# RESPONSE SCHEMA
-# ═══════════════════════════════════════════════════════════════
+class SideCamData(BaseModel):
+    session_id: str
+    url: str
+
 class ProctorResponse(BaseModel):
     cheating: bool
-    message:  str
+    message: str
 
+# ═══════════════════════════════════════════════
+# START SESSION
+# ═══════════════════════════════════════════════
+@app.post("/session/start")
+async def start_session(data: SessionData):
+    sessions[data.session_id] = {
+        "student_id": data.student_id,
+        "cheating": False,
+        "message": "Starting...",
+        "last_frame": None,
+        "side_cam_url": None,
+        "timestamp": time.time()
+    }
 
-# ═══════════════════════════════════════════════════════════════
-# ENDPOINT  →  POST /proctor/upload-frame
-# ═══════════════════════════════════════════════════════════════
+    return {"status": "session started"}
+
+# ═══════════════════════════════════════════════
+# REGISTER SIDE CAMERA
+# ═══════════════════════════════════════════════
+@app.post("/session/sidecam")
+async def register_sidecam(data: SideCamData):
+    if data.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    sessions[data.session_id]["side_cam_url"] = data.url
+    return {"status": "side camera registered"}
+
+# ═══════════════════════════════════════════════
+# UPLOAD FRAME (AI DETECTION)
+# ═══════════════════════════════════════════════
 @app.post("/proctor/upload-frame", response_model=ProctorResponse)
-async def upload_frame(file: UploadFile = File(...)):
-    """
-    Receives a JPEG/PNG frame from the Flutter app,
-    runs phone detection, and returns the result.
+async def upload_frame(
+    session_id: str,
+    file: UploadFile = File(...)
+):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    Flutter sends:  multipart/form-data  key="file"
-    Returns:        { "cheating": bool, "message": str }
-    """
-
-    # ── 1. Validate file type ────────────────────────────────
+    # Validate
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
-        raise HTTPException(
-            status_code=415,
-            detail="Unsupported file type. Send JPEG or PNG.",
-        )
+        raise HTTPException(status_code=415, detail="Invalid file")
 
-    # ── 2. Read bytes → OpenCV frame ─────────────────────────
-    try:
-        contents = await file.read()
-        np_arr   = np.frombuffer(contents, np.uint8)
-        frame    = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("cv2.imdecode returned None")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot decode image: {e}")
+    # Read image
+    contents = await file.read()
+    np_arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # ── 3. Pre-process (same pipeline as your desktop app) ───
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+
+    # Preprocess
     frame = resize_frame(frame, CFG.RESIZE_WIDTH_FRONT)
-    h, w  = frame.shape[:2]
+    h, w = frame.shape[:2]
 
-    # ── 4. Hand detection ────────────────────────────────────
+    # Hands
     hand_boxes = get_hand_boxes_simple(frame, hands_model)
 
-    # ── 5. YOLO object detection ─────────────────────────────
-    persons, raw_phones, books = detect_objects(frame, yolo, source="front")
+    # YOLO detection
+    persons, raw_phones, books = detect_objects(frame, yolo, "front")
 
-    # ── 6. Phone validation (your existing logic, unchanged) ──
     validated_phones = validate_phones(
-        raw_phones, persons, hand_boxes, h, w, source="front"
+        raw_phones, persons, hand_boxes, h, w, "front"
     )
 
-    # Crop-based fallback — same logic as desktop main loop
+    # Crop fallback
     if not validated_phones and persons:
-        crop_phones = detect_phone_in_crop(frame, persons, yolo, "front", "person")
-        if crop_phones:
+        crop = detect_phone_in_crop(frame, persons, yolo, "front", "person")
+        if crop:
             validated_phones = validate_phones(
-                crop_phones, persons, hand_boxes, h, w, source="front"
+                crop, persons, hand_boxes, h, w, "front"
             )
 
     if not validated_phones and hand_boxes:
-        hand_phones = detect_phone_in_crop(frame, hand_boxes, yolo, "front", "hand")
-        if hand_phones:
+        crop = detect_phone_in_crop(frame, hand_boxes, yolo, "front", "hand")
+        if crop:
             validated_phones = validate_phones(
-                hand_phones, persons, hand_boxes, h, w, source="front"
+                crop, persons, hand_boxes, h, w, "front"
             )
 
-    # ── 7. Build response ────────────────────────────────────
-    cheating_detected = len(validated_phones) > 0
-    message = "Mobile phone detected!" if cheating_detected else "Clear"
+    # Result
+    cheating = len(validated_phones) > 0
+    message = "Mobile phone detected!" if cheating else "Clear"
 
-    return ProctorResponse(cheating=cheating_detected, message=message)
+    # Store session data
+    sessions[session_id]["cheating"] = cheating
+    sessions[session_id]["message"] = message
+    sessions[session_id]["last_frame"] = frame
+    sessions[session_id]["timestamp"] = time.time()
 
+    return {"cheating": cheating, "message": message}
 
-# ═══════════════════════════════════════════════════════════════
-# HEALTH CHECK
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+# ADMIN: GET ALL SESSIONS
+# ═══════════════════════════════════════════════
+@app.get("/admin/sessions")
+async def get_sessions():
+    return sessions
+
+# ═══════════════════════════════════════════════
+# VIDEO STREAM (MAIN CAM)
+# ═══════════════════════════════════════════════
+def generate_frames(session_id: str):
+    while True:
+        if session_id not in sessions:
+            break
+
+        frame = sessions[session_id]["last_frame"]
+
+        if frame is None:
+            continue
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        frame_bytes = buffer.tobytes()
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+        )
+
+@app.get("/admin/stream/{session_id}")
+async def stream_video(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404)
+
+    return StreamingResponse(
+        generate_frames(session_id),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+# ═══════════════════════════════════════════════
+# HEALTH
+# ═══════════════════════════════════════════════
 @app.get("/health")
 async def health():
     return {"status": "ok"}
