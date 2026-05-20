@@ -4,7 +4,9 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 pydantic
+pydantic[email]
 python-multipart
 opencv-python
 ultralytics
 mediapipe
+python-jose[cryptography]

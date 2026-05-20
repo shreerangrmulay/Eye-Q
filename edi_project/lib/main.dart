@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import 'app_state.dart';
 import 'auth_screen.dart';
 import 'student_panel.dart';
 import 'admin_panel.dart';
@@ -12,20 +15,52 @@ class ProctorSystemApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'AI Proctoring Node',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.light,
+    return ChangeNotifierProvider(
+      create: (_) => AppState()..bootstrap(),
+      child: MaterialApp(
+        title: 'ProctorAI',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData(
+          useMaterial3: true,
+          brightness: Brightness.dark,
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xFF00E5FF),
+            brightness: Brightness.dark,
+          ),
+          scaffoldBackgroundColor: const Color(0xFF080B12),
+          cardTheme: CardThemeData(
+            color: const Color(0xFF111827),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+          inputDecorationTheme: InputDecorationTheme(
+            filled: true,
+            fillColor: const Color(0xFF0F172A),
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+        ),
+        home: const _Gate(),
+        routes: {
+          '/login': (context) => const AuthScreen(),
+          '/student_home': (context) => const StudentPanel(),
+          '/admin_home': (context) => const AdminPanel(),
+        },
       ),
-      initialRoute: '/',
-      routes: {
-        '/': (context) => const AuthScreen(),
-        '/student_home': (context) => const StudentPanel(),
-        '/admin_home': (context) => const AdminPanel(),
-      },
     );
+  }
+}
+
+class _Gate extends StatelessWidget {
+  const _Gate();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppState>();
+    if (!state.isReady) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (!state.isAuthenticated) return const AuthScreen();
+    return state.isAdmin ? const AdminPanel() : const StudentPanel();
   }
 }

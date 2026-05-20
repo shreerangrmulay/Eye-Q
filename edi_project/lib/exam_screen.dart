@@ -1,300 +1,806 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:convert';
-import 'package:flutter/material.dart';
-import 'package:camera/camera.dart';
-import 'package:http/http.dart' as http;
 
-import 'api_service.dart';
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+import 'app_state.dart';
 
 class ExamScreen extends StatefulWidget {
+  const ExamScreen({
+    super.key,
+    required this.examTitle,
+    required this.subject,
+    required this.sideCameraUrl,
+    required this.studentId,
+    required this.studentName,
+  });
+
   final String examTitle;
-  const ExamScreen({super.key, required this.examTitle});
+  final String subject;
+  final String sideCameraUrl;
+  final String studentId;
+  final String studentName;
 
   @override
   State<ExamScreen> createState() => _ExamScreenState();
 }
 
-class _ExamScreenState extends State<ExamScreen> {
-  CameraController? _controller;
+class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
+  final List<_Question> _questions = const [
+    _Question('Which algorithm is supervised learning?', [
+      'K-Means',
+      'Linear Regression',
+      'PCA',
+      'Association Rules',
+    ]),
+    _Question('Which layer secures HTTPS traffic?', [
+      'Transport',
+      'Presentation',
+      'Network',
+      'Physical',
+    ]),
+    _Question('What does a confusion matrix summarize?', [
+      'Disk usage',
+      'Model predictions',
+      'Network packets',
+      'CPU scheduling',
+    ]),
+    _Question('Which metric is useful for imbalanced classes?', [
+      'Accuracy only',
+      'F1 score',
+      'Clock speed',
+      'Bandwidth',
+    ]),
+    _Question('What is phishing?', [
+      'A social engineering attack',
+      'A compiler phase',
+      'A sorting method',
+      'A database index',
+    ]),
+  ];
+
+  CameraController? _cameraController;
+  WebSocketChannel? _channel;
   Timer? _captureTimer;
-  final ApiService _apiService = ApiService();
+  Timer? _sideCheckTimer;
+  Timer? _clockTimer;
+  Timer? _reconnectTimer;
 
-  bool _isCameraReady = false;
-  String? _selectedOption;
+  late final String _sessionId;
+  final Map<String, String> _answers = {};
 
-  bool _isCheatingDetected = false;
-  String _aiMessage = "";
-
-  bool _isUploading = false;
-
-  // 🔥 SESSION ID (later make dynamic)
-  final String sessionId = "999";
+  int _currentIndex = 0;
+  int _remainingSeconds = 60 * 60;
+  int _warningCount = 0;
+  int _tabSwitchCount = 0;
+  double _cheatScore = 0;
+  double _confidence = 0;
+  bool _cameraReady = false;
+  bool _monitoringStarted = false;
+  bool _uploading = false;
+  bool _checkingSideCamera = false;
+  bool _connected = false;
+  bool _submitting = false;
+  DateTime? _lastDisconnectLogAt;
+  String _aiMessage = 'AI monitoring active';
+  String _riskLevel = 'LOW';
+  String _candidateStatus = 'MONITORING';
+  String _cheatType = '';
+  String _sideCameraStatus = 'UNKNOWN';
 
   @override
   void initState() {
     super.initState();
-    _startSession();   // ✅ Start backend session
-    _initializeCamera();
+    WidgetsBinding.instance.addObserver(this);
+    _sessionId = '${widget.studentId}-${DateTime.now().millisecondsSinceEpoch}';
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    _startExam();
   }
 
-  // ─────────────────────────────────────────────
-  // 🚀 START SESSION (NEW)
-  // ─────────────────────────────────────────────
-  Future<void> _startSession() async {
+  Future<void> _startExam() async {
+    final app = context.read<AppState>();
     try {
-      await http.post(
-        Uri.parse("${ApiService.baseUrl}/session/start"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "session_id": sessionId,
-          "student_id": "student_1"
-        }),
+      final session = await app.api.startSession(
+        sessionId: _sessionId,
+        studentId: widget.studentId,
+        studentName: widget.studentName,
+        examTitle: widget.examTitle,
+        subject: widget.subject,
+        sideCameraUrl: widget.sideCameraUrl,
       );
-    } catch (e) {
-      debugPrint("Session start error: $e");
+      _connectWebSocket();
+      _handleRealtime(session);
+      if (session['status'] == 'REJOIN_PENDING') {
+        setState(() {
+          _connected = true;
+          _aiMessage = 'Waiting for proctor approval to rejoin this exam.';
+        });
+        return;
+      }
+      await _activateMonitoring();
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _connected = false;
+          _aiMessage = 'Backend connection failed: $error';
+        });
+      }
     }
   }
 
-  // ─────────────────────────────────────────────
-  // CAMERA INIT
-  // ─────────────────────────────────────────────
+  Future<void> _activateMonitoring() async {
+    if (_monitoringStarted) return;
+    _monitoringStarted = true;
+    await _initializeCamera();
+    _startSideCameraWatchdog();
+    _startClock();
+  }
+
   Future<void> _initializeCamera() async {
+    final cameras = await availableCameras();
+    if (cameras.isEmpty) {
+      setState(() => _aiMessage = 'No camera detected');
+      return;
+    }
+
+    final front = cameras.firstWhere(
+      (camera) => camera.lensDirection == CameraLensDirection.front,
+      orElse: () => cameras.first,
+    );
+
+    _cameraController = CameraController(
+      front,
+      ResolutionPreset.low,
+      enableAudio: false,
+    );
+    await _cameraController!.initialize();
+    if (!mounted) return;
+    setState(() => _cameraReady = true);
+    _startFrameUpload();
+  }
+
+  void _connectWebSocket() {
     try {
-      final cameras = await availableCameras();
-      if (cameras.isEmpty) return;
-
-      final front = cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.front,
-        orElse: () => cameras.first,
+      _channel?.sink.close();
+      _channel = WebSocketChannel.connect(
+        Uri.parse(context.read<AppState>().api.sessionWebSocketUrl(_sessionId)),
       );
-
-      _controller = CameraController(
-        front,
-        ResolutionPreset.low,
-        enableAudio: false,
+      setState(() => _connected = true);
+      _channel!.stream.listen(
+        (data) =>
+            _handleRealtime(jsonDecode(data as String) as Map<String, dynamic>),
+        onError: (_) => _scheduleReconnect(),
+        onDone: _scheduleReconnect,
       );
-
-      await _controller!.initialize();
-      if (!mounted) return;
-
-      setState(() => _isCameraReady = true);
-      _startProctoring();
-    } catch (e) {
-      debugPrint("Camera Init Error: $e");
+    } catch (_) {
+      _scheduleReconnect();
     }
   }
 
-  // ─────────────────────────────────────────────
-  // AI PROCTORING LOOP
-  // ─────────────────────────────────────────────
-  void _startProctoring() {
-    _captureTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      if (_isUploading) return;
+  void _scheduleReconnect() {
+    if (!mounted) return;
+    setState(() => _connected = false);
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 3), _connectWebSocket);
+  }
 
-      final ctrl = _controller;
-      if (ctrl == null ||
-          !ctrl.value.isInitialized ||
-          ctrl.value.isTakingPicture) {
+  void _handleRealtime(Map<String, dynamic> data) {
+    if (!mounted) return;
+    setState(() {
+      _warningCount = (data['warning_count'] ?? _warningCount) as int;
+      _cheatScore = ((data['cheat_score'] ?? _cheatScore) as num).toDouble();
+      _confidence = ((data['confidence'] ?? _confidence) as num).toDouble();
+      _riskLevel = (data['risk_level'] ?? _riskLevel).toString();
+      _cheatType = (data['cheat_type'] ?? _cheatType).toString();
+      _sideCameraStatus =
+          (data['side_camera_status'] ?? _sideCameraStatus).toString();
+      _candidateStatus =
+          (data['candidate_status'] ?? data['status'] ?? _candidateStatus)
+              .toString();
+      _aiMessage = (data['message'] ?? data['cheat_message'] ?? _aiMessage)
+          .toString();
+    });
+    if (_candidateStatus == 'MONITORING' && !_monitoringStarted) {
+      _activateMonitoring();
+    }
+    if (_candidateStatus == 'AUTO_SUBMIT_REQUIRED' || _cheatScore >= 95) {
+      _submitExam(reason: 'auto_submitted_cheating_threshold');
+    }
+    if (_candidateStatus == 'TERMINATED') {
+      _showClosedDialog('This exam session was terminated by the proctor.');
+    }
+    if (_candidateStatus == 'REJOIN_DENIED') {
+      _showClosedDialog('Your request to rejoin this exam was denied.');
+    }
+  }
+
+  void _startClock() {
+    _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      if (_remainingSeconds <= 1) {
+        _submitExam(reason: 'time_expired');
+      } else {
+        setState(() => _remainingSeconds--);
+      }
+    });
+  }
+
+  void _startFrameUpload() {
+    _captureTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
+      final controller = _cameraController;
+      if (_uploading ||
+          controller == null ||
+          !controller.value.isInitialized ||
+          controller.value.isTakingPicture) {
         return;
       }
 
-      _isUploading = true;
-
+      _uploading = true;
+      final api = context.read<AppState>().api;
       try {
-        final XFile image = await ctrl.takePicture();
-
-        // 🔥 Send with session ID
-        final result = await _apiService.uploadFrame(
-          File(image.path),
-          sessionId,
+        final image = await controller.takePicture();
+        final bytes = await image.readAsBytes();
+        final result = await api.uploadFrame(
+          bytes,
+          _sessionId,
+          filename: image.name.isEmpty ? 'front-camera.jpg' : image.name,
         );
-
-        try {
-          await File(image.path).delete();
-        } catch (_) {}
-
+        _handleRealtime(result);
+        if (mounted) setState(() => _connected = true);
+      } catch (_) {
         if (mounted) {
           setState(() {
-            _isCheatingDetected = result['cheating'] ?? false;
-            _aiMessage = result['message'] ?? "";
+            _connected = false;
+            _aiMessage =
+                'Network interrupted. Reconnecting monitoring channel.';
           });
         }
-      } catch (e) {
-        debugPrint("Proctoring error: $e");
-        if (mounted) {
-          setState(() {
-            _isCheatingDetected = false;
-            _aiMessage = "Connection lost";
-          });
+        final now = DateTime.now();
+        final shouldLogDisconnect = _lastDisconnectLogAt == null ||
+            now.difference(_lastDisconnectLogAt!) > const Duration(seconds: 20);
+        if (shouldLogDisconnect) {
+          _lastDisconnectLogAt = now;
+          await _logEvent(
+            'DISCONNECT',
+            'Candidate monitoring connection interrupted',
+            severity: 'MEDIUM',
+            scoreDelta: 4,
+          );
         }
       } finally {
-        _isUploading = false;
+        _uploading = false;
       }
+    });
+  }
+
+  void _startSideCameraWatchdog() {
+    _sideCheckTimer?.cancel();
+    _sideCheckTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!_monitoringStarted || _submitting || _checkingSideCamera) return;
+      _checkingSideCamera = true;
+      try {
+        final result = await context.read<AppState>().api.checkSideCamera(
+          _sessionId,
+        );
+        _handleRealtime(result);
+      } catch (_) {
+      } finally {
+        _checkingSideCamera = false;
+      }
+    });
+  }
+
+  Future<void> _logEvent(
+    String type,
+    String message, {
+    String severity = 'INFO',
+    double scoreDelta = 0,
+  }) async {
+    try {
+      await context.read<AppState>().api.logClientEvent(
+        sessionId: _sessionId,
+        eventType: type,
+        message: message,
+        severity: severity,
+        scoreDelta: scoreDelta,
+      );
+    } catch (_) {}
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.hidden) {
+      _tabSwitchCount++;
+      _logEvent(
+        'TAB_SWITCH',
+        'Candidate left the exam window',
+        severity: 'HIGH',
+        scoreDelta: 15,
+      );
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<void> _submitExam({String reason = 'submitted_by_candidate'}) async {
+    if (_submitting) return;
+    if (!_monitoringStarted) return;
+    setState(() => _submitting = true);
+    try {
+      await context.read<AppState>().api.submitExam(
+        sessionId: _sessionId,
+        answers: _answers,
+        reason: reason,
+      );
+      if (!mounted) return;
+      await _showClosedDialog(
+        reason == 'submitted_by_candidate'
+            ? 'Exam submitted successfully.'
+            : 'Exam auto-submitted.',
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Submit failed: $error')));
+      }
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  Future<void> _showClosedDialog(String message) async {
+    _captureTimer?.cancel();
+    _sideCheckTimer?.cancel();
+    _clockTimer?.cancel();
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Exam Closed'),
+        content: Text(message),
+        actions: [
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pop(context);
+            },
+            child: const Text('Return'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _captureTimer?.cancel();
+    _sideCheckTimer?.cancel();
+    _clockTimer?.cancel();
+    _reconnectTimer?.cancel();
+    _channel?.sink.close();
+    _cameraController?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final question = _questions[_currentIndex];
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: false,
+          title: Text(widget.examTitle),
+          actions: [
+            _StatusChip(
+              icon: _connected ? Icons.cloud_done : Icons.cloud_off,
+              label: _connected ? 'Connected' : 'Reconnecting',
+              color: _connected ? Colors.greenAccent : Colors.orangeAccent,
+            ),
+            const SizedBox(width: 8),
+            _StatusChip(
+              icon: Icons.timer,
+              label: _timeText,
+              color: Colors.redAccent,
+            ),
+            const SizedBox(width: 12),
+          ],
+        ),
+        body: LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 980;
+            final content = [
+              Expanded(flex: 3, child: _buildQuestionPanel(question)),
+              const SizedBox(width: 16, height: 16),
+              SizedBox(
+                width: wide ? 340 : double.infinity,
+                child: _buildMonitorPanel(),
+              ),
+            ];
+            return Padding(
+              padding: const EdgeInsets.all(18),
+              child: wide
+                  ? Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: content,
+                    )
+                  : Column(children: content),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQuestionPanel(_Question question) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text(
+                  'Question ${_currentIndex + 1} of ${_questions.length}',
+                  style: const TextStyle(color: Colors.white70),
+                ),
+                const Spacer(),
+                Text(
+                  '${((_currentIndex + 1) / _questions.length * 100).round()}% complete',
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            LinearProgressIndicator(
+              value: (_currentIndex + 1) / _questions.length,
+            ),
+            const SizedBox(height: 24),
+            Text(
+              question.title,
+              style: Theme.of(
+                context,
+              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 18),
+            Expanded(
+              child: RadioGroup<String>(
+                groupValue: _answers[_currentIndex.toString()],
+                onChanged: (value) => setState(
+                  () => _answers[_currentIndex.toString()] = value ?? '',
+                ),
+                child: ListView.separated(
+                  itemCount: question.options.length,
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(height: 10),
+                  itemBuilder: (context, index) {
+                    final option = question.options[index];
+                    return RadioListTile<String>(
+                      value: option,
+                      title: Text(option),
+                      tileColor: const Color(0xFF0F172A),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: List.generate(
+                _questions.length,
+                (index) => ChoiceChip(
+                  selected: index == _currentIndex,
+                  label: Text('${index + 1}'),
+                  avatar: _answers.containsKey(index.toString())
+                      ? const Icon(Icons.check, size: 16)
+                      : null,
+                  onSelected: (_) => setState(() => _currentIndex = index),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _currentIndex == 0
+                      ? null
+                      : () => setState(() => _currentIndex--),
+                  icon: const Icon(Icons.chevron_left),
+                  label: const Text('Previous'),
+                ),
+                const SizedBox(width: 10),
+                OutlinedButton.icon(
+                  onPressed: _currentIndex == _questions.length - 1
+                      ? null
+                      : () => setState(() => _currentIndex++),
+                  icon: const Icon(Icons.chevron_right),
+                  label: const Text('Next'),
+                ),
+                const Spacer(),
+                FilledButton.icon(
+                  onPressed: _submitting ? null : () => _submitExam(),
+                  icon: _submitting
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.task_alt),
+                  label: const Text('Submit Exam'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMonitorPanel() {
+    final alertColor = _riskLevel == 'CRITICAL' || _riskLevel == 'HIGH'
+        ? Colors.redAccent
+        : _riskLevel == 'MEDIUM'
+        ? Colors.orangeAccent
+        : Colors.greenAccent;
+
+    return Column(
+      children: [
+        AspectRatio(
+          aspectRatio: 4 / 3,
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: alertColor, width: 2),
+              boxShadow: [
+                BoxShadow(
+                  color: alertColor.withValues(alpha: 0.22),
+                  blurRadius: 18,
+                ),
+              ],
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: _cameraReady
+                ? CameraPreview(_cameraController!)
+                : const Center(child: CircularProgressIndicator()),
+          ),
+        ),
+        const SizedBox(height: 12),
+        AspectRatio(
+          aspectRatio: 4 / 3,
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.black,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.white24),
+            ),
+            clipBehavior: Clip.antiAlias,
+            child: _SnapshotFeed(
+              sessionId: _sessionId,
+              side: true,
+              emptyText: 'Waiting for side camera feed',
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Icon(Icons.radar, color: alertColor),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        'AI Monitoring Active',
+                        style: TextStyle(fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                _Metric(
+                  label: 'Candidate status',
+                  value: _candidateStatus,
+                  color: alertColor,
+                ),
+                _Metric(
+                  label: 'Risk level',
+                  value: _riskLevel,
+                  color: alertColor,
+                ),
+                _Metric(
+                  label: 'Cheating probability',
+                  value: '${_cheatScore.toStringAsFixed(0)}%',
+                  color: alertColor,
+                ),
+                _Metric(
+                  label: 'Confidence',
+                  value: '${(_confidence * 100).toStringAsFixed(0)}%',
+                  color: Colors.cyanAccent,
+                ),
+                _Metric(
+                  label: 'Warnings',
+                  value: '$_warningCount',
+                  color: Colors.orangeAccent,
+                ),
+                _Metric(
+                  label: 'Cheat type',
+                  value: _cheatType.isEmpty ? 'None' : _cheatType,
+                  color: alertColor,
+                ),
+                _Metric(
+                  label: 'Side camera',
+                  value: _sideCameraStatus,
+                  color: _sideCameraStatus == 'ONLINE'
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                ),
+                _Metric(
+                  label: 'Tab switches',
+                  value: '$_tabSwitchCount',
+                  color: Colors.redAccent,
+                ),
+                const Divider(height: 22),
+                Text(
+                  _aiMessage,
+                  style: TextStyle(
+                    color: alertColor,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  String get _timeText {
+    final minutes = (_remainingSeconds ~/ 60).toString().padLeft(2, '0');
+    final seconds = (_remainingSeconds % 60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
+  }
+}
+
+class _SnapshotFeed extends StatefulWidget {
+  const _SnapshotFeed({
+    required this.sessionId,
+    required this.side,
+    required this.emptyText,
+  });
+
+  final String sessionId;
+  final bool side;
+  final String emptyText;
+
+  @override
+  State<_SnapshotFeed> createState() => _SnapshotFeedState();
+}
+
+class _SnapshotFeedState extends State<_SnapshotFeed> {
+  Timer? _timer;
+  int _cacheKey = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _timer = Timer.periodic(const Duration(milliseconds: 700), (_) {
+      if (mounted) setState(() => _cacheKey++);
     });
   }
 
   @override
   void dispose() {
-    _captureTimer?.cancel();
-    _controller?.dispose();
+    _timer?.cancel();
     super.dispose();
   }
 
-  // ─────────────────────────────────────────────
-  // UI
-  // ─────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.examTitle),
-        automaticallyImplyLeading: false,
-        actions: [_buildTimerBadge()],
-      ),
-      body: Stack(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: _buildQuestionUI(),
-          ),
-          Positioned(
-            top: 10,
-            right: 10,
-            child: _buildCameraContainer(),
-          ),
-          if (_isCheatingDetected)
-            Positioned(
-              top: 80,
-              left: 20,
-              right: 20,
-              child: _buildWarningBanner(),
-            ),
-        ],
+    final api = context.read<AppState>().api;
+    final url = widget.side
+        ? api.getSideSnapshotUrl(widget.sessionId, _cacheKey)
+        : api.getSnapshotUrl(widget.sessionId, _cacheKey);
+    return Image.network(
+      url,
+      fit: BoxFit.contain,
+      gaplessPlayback: true,
+      errorBuilder: (context, error, stackTrace) => Center(
+        child: Text(
+          widget.emptyText,
+          style: const TextStyle(color: Colors.white54),
+          textAlign: TextAlign.center,
+        ),
       ),
     );
   }
+}
 
-  // ─────────────────────────────────────────────
-  // WARNING BANNER
-  // ─────────────────────────────────────────────
-  Widget _buildWarningBanner() {
+class _Question {
+  const _Question(this.title, this.options);
+
+  final String title;
+  final List<String> options;
+}
+
+class _StatusChip extends StatelessWidget {
+  const _StatusChip({
+    required this.icon,
+    required this.label,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: Colors.red.withValues(alpha: 0.9),
-        borderRadius: BorderRadius.circular(8),
-        boxShadow: const [
-          BoxShadow(color: Colors.black26, blurRadius: 4)
-        ],
+        color: color.withValues(alpha: 0.12),
+        border: Border.all(color: color.withValues(alpha: 0.45)),
+        borderRadius: BorderRadius.circular(30),
       ),
       child: Row(
         children: [
-          const Icon(Icons.warning_amber_rounded, color: Colors.white),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              "WARNING: $_aiMessage",
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
+          Icon(icon, color: color, size: 16),
+          const SizedBox(width: 6),
+          Text(
+            label,
+            style: TextStyle(color: color, fontWeight: FontWeight.w700),
           ),
         ],
       ),
     );
   }
+}
 
-  // ─────────────────────────────────────────────
-  // CAMERA VIEW
-  // ─────────────────────────────────────────────
-  Widget _buildCameraContainer() {
-    return Container(
-      width: 110,
-      height: 150,
-      decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: _isCheatingDetected ? Colors.red : Colors.blue,
-          width: 3,
-        ),
-      ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: _isCameraReady
-            ? CameraPreview(_controller!)
-            : const Center(child: CircularProgressIndicator()),
-      ),
-    );
-  }
+class _Metric extends StatelessWidget {
+  const _Metric({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
 
-  Widget _buildTimerBadge() {
-    return Container(
-      margin: const EdgeInsets.only(right: 130),
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        color: Colors.red.shade50,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: const Text(
-        "59:52",
-        style: TextStyle(
-          color: Colors.red,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-    );
-  }
+  final String label;
+  final String value;
+  final Color color;
 
-  // ─────────────────────────────────────────────
-  // QUESTION UI
-  // ─────────────────────────────────────────────
-  Widget _buildQuestionUI() {
-    final options = [
-      "K-Means",
-      "Linear Regression",
-      "PCA",
-      "Association"
-    ];
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Text("Question 1 of 20",
-            style: TextStyle(color: Colors.grey)),
-        const SizedBox(height: 10),
-        const Text(
-          "Which of the following is Supervised Learning?",
-          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
-        const SizedBox(height: 20),
-
-        Expanded(
-          child: RadioGroup<String>(
-            groupValue: _selectedOption,
-            onChanged: (v) => setState(() => _selectedOption = v),
-            child: ListView(
-              children: options.map((opt) {
-                return RadioListTile<String>(
-                  title: Text(opt),
-                  value: opt,
-                );
-              }).toList(),
-            ),
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(label, style: const TextStyle(color: Colors.white60)),
           ),
-        ),
-
-        SizedBox(
-          width: double.infinity,
-          height: 50,
-          child: ElevatedButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text("SUBMIT EXAM"),
+          Text(
+            value,
+            style: TextStyle(color: color, fontWeight: FontWeight.w800),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

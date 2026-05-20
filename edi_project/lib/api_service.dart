@@ -1,212 +1,267 @@
 import 'dart:convert';
-import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:http/http.dart' as http;
 
+class ApiException implements Exception {
+  final String message;
+  final int? statusCode;
+
+  ApiException(this.message, [this.statusCode]);
+
+  @override
+  String toString() => message;
+}
+
 class ApiService {
-  // ─────────────────────────────────────────────
-  // BASE URL CONFIGURATION
-  // ─────────────────────────────────────────────
-  // LOCAL DEV    → http://localhost:8000
-  // RENDER CLOUD → https://proctorai-api.onrender.com  (update after deploy)
-  // ANDROID EMU  → http://10.0.2.2:8000
-  static const String baseUrl = "http://localhost:8000";
+  ApiService({this.token});
 
-  // ── Render cloud URL (update after deployment) ──
-  static const String cloudUrl = "https://proctorai-api.onrender.com";
+  static const String baseUrl = String.fromEnvironment(
+    'API_URL',
+    defaultValue: 'http://localhost:8000',
+  );
 
-  // ─────────────────────────────────────────────
-  // START SESSION
-  // ─────────────────────────────────────────────
-  Future<void> startSession(String sessionId, String studentId,
-      {String studentName = "Unknown", String examTitle = "General Exam"}) async {
-    try {
-      // Start on LOCAL AI server
-      await http.post(
-        Uri.parse("$baseUrl/session/start"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "session_id": sessionId,
-          "student_id": studentId,
-        }),
-      );
+  final String? token;
 
-      // Also register on CLOUD backend
-      await http.post(
-        Uri.parse("$cloudUrl/session/start"),
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "session_id": sessionId,
-          "student_id": studentId,
-          "student_name": studentName,
-          "exam_title": examTitle,
-        }),
-      );
-    } catch (e) {
-      print("Start session error: $e");
-    }
+  Map<String, String> get _headers => {
+    'Content-Type': 'application/json',
+    if (token != null && token!.isNotEmpty) 'Authorization': 'Bearer $token',
+  };
+
+  Uri _uri(String path, [Map<String, String>? query]) {
+    final base = Uri.parse(baseUrl);
+    return base.replace(
+      path: '${base.path}${path.startsWith('/') ? path : '/$path'}',
+      queryParameters: query,
+    );
   }
 
-  // ─────────────────────────────────────────────
-  // REGISTER SIDE CAMERA (optional for later)
-  // ─────────────────────────────────────────────
-  Future<void> registerSideCam(String sessionId, String url) async {
-    try {
-      final uri = Uri.parse("$baseUrl/session/sidecam");
-
-      await http.post(
-        uri,
-        headers: {"Content-Type": "application/json"},
-        body: jsonEncode({
-          "session_id": sessionId,
-          "url": url,
-        }),
-      );
-    } catch (e) {
-      print("Side cam error: $e");
-    }
+  Future<Map<String, dynamic>> login({
+    required String username,
+    required String password,
+    required String role,
+    required bool rememberMe,
+  }) async {
+    final response = await http.post(
+      _uri('/auth/login'),
+      headers: _headers,
+      body: jsonEncode({
+        'username': username,
+        'password': password,
+        'role': role,
+        'remember_me': rememberMe,
+      }),
+    );
+    return _decodeMap(response);
   }
 
-  // ─────────────────────────────────────────────
-  // UPLOAD FRAME  →  POST /proctor/upload-frame
-  // ─────────────────────────────────────────────
-  /// Sends a camera frame to the LOCAL AI server for detection,
-  /// then forwards the result to the CLOUD backend for admin dashboard.
+  Future<Map<String, dynamic>> health() async {
+    final response = await http
+        .get(_uri('/health'))
+        .timeout(const Duration(seconds: 4));
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> startSession({
+    required String sessionId,
+    required String studentId,
+    required String studentName,
+    required String examTitle,
+    required String subject,
+    required String sideCameraUrl,
+  }) async {
+    final response = await http.post(
+      _uri('/session/start'),
+      headers: _headers,
+      body: jsonEncode({
+        'session_id': sessionId,
+        'student_id': studentId,
+        'student_name': studentName,
+        'exam_title': examTitle,
+        'subject': subject,
+        'side_camera_url': sideCameraUrl,
+      }),
+    );
+    return _decodeMap(response);
+  }
+
   Future<Map<String, dynamic>> uploadFrame(
-      File imageFile, String sessionId) async {
-    try {
-      final uri = Uri.parse(
-          "$baseUrl/proctor/upload-frame?session_id=$sessionId");
-
-      final request = http.MultipartRequest('POST', uri);
-
-      request.files.add(
-        await http.MultipartFile.fromPath('file', imageFile.path),
-      );
-
-      final streamedResponse = await request.send().timeout(
-        const Duration(seconds: 10),
-      );
-
-      final responseBody =
-          await streamedResponse.stream.bytesToString();
-
-      if (streamedResponse.statusCode == 200) {
-        final decoded =
-            jsonDecode(responseBody) as Map<String, dynamic>;
-
-        final cheating = decoded["cheating"] ?? false;
-        final message = decoded["message"] ?? "Clear";
-
-        // ── Forward result to cloud backend ──
-        try {
-          await http.post(
-            Uri.parse("$cloudUrl/proctor/update"),
-            headers: {"Content-Type": "application/json"},
-            body: jsonEncode({
-              "session_id": sessionId,
-              "cheating": cheating,
-              "cheat_type": cheating ? "PHONE" : "",
-              "message": message,
-              "cheat_score_delta": cheating ? 10.0 : 0.0,
-            }),
-          );
-        } catch (_) {
-          // Cloud push is best-effort; don't break the student experience
-        }
-
-        return {
-          "cheating": cheating,
-          "message": message,
-        };
-      } else {
-        return {
-          "cheating": false,
-          "message":
-              "Server error (${streamedResponse.statusCode})",
-        };
-      }
-    } on SocketException {
-      return {
-        "cheating": false,
-        "message": "No connection to server"
-      };
-    } on http.ClientException {
-      return {
-        "cheating": false,
-        "message": "Network error"
-      };
-    } on FormatException {
-      return {
-        "cheating": false,
-        "message": "Invalid response"
-      };
-    } catch (e) {
-      return {
-        "cheating": false,
-        "message": "Unexpected error: $e"
-      };
+    Uint8List imageBytes,
+    String sessionId, {
+    String filename = 'front-camera.jpg',
+  }) async {
+    final request = http.MultipartRequest(
+      'POST',
+      _uri('/proctor/upload-frame', {'session_id': sessionId}),
+    );
+    if (token != null && token!.isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer $token';
     }
+    request.files.add(
+      http.MultipartFile.fromBytes('file', imageBytes, filename: filename),
+    );
+
+    final streamed = await request.send().timeout(const Duration(seconds: 12));
+    final body = await streamed.stream.bytesToString();
+    if (streamed.statusCode >= 200 && streamed.statusCode < 300) {
+      return jsonDecode(body) as Map<String, dynamic>;
+    }
+    throw ApiException(_errorMessage(body), streamed.statusCode);
   }
 
-  // ─────────────────────────────────────────────
-  // GET ALL SESSIONS (FOR ADMIN PANEL) — from cloud
-  // ─────────────────────────────────────────────
-  Future<List<dynamic>> getSessions() async {
-    try {
-      final uri = Uri.parse("$cloudUrl/admin/sessions");
-
-      final response = await http.get(uri);
-
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body) as List<dynamic>;
-      } else {
-        return [];
-      }
-    } catch (e) {
-      print("Fetch sessions error: $e");
-      return [];
-    }
+  Future<Map<String, dynamic>> checkSideCamera(String sessionId) async {
+    final response = await http.post(
+      _uri('/proctor/side-camera/check/$sessionId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
   }
 
-  // ─────────────────────────────────────────────
-  // GET DASHBOARD STATS — from cloud
-  // ─────────────────────────────────────────────
+  Future<Map<String, dynamic>> logClientEvent({
+    required String sessionId,
+    required String eventType,
+    required String message,
+    String severity = 'INFO',
+    double scoreDelta = 0,
+    Map<String, dynamic> metadata = const {},
+  }) async {
+    final response = await http.post(
+      _uri('/session/$sessionId/event'),
+      headers: _headers,
+      body: jsonEncode({
+        'event_type': eventType,
+        'message': message,
+        'severity': severity,
+        'score_delta': scoreDelta,
+        'metadata': metadata,
+      }),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> submitExam({
+    required String sessionId,
+    required Map<String, String> answers,
+    String reason = 'submitted_by_candidate',
+  }) async {
+    final response = await http.post(
+      _uri('/session/$sessionId/submit'),
+      headers: _headers,
+      body: jsonEncode({'answers': answers, 'reason': reason}),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> getSessions({String? subject}) async {
+    final response = await http.get(
+      _uri('/admin/sessions', {
+        if (subject != null && subject != 'ALL') 'subject': subject,
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> getSessionDetail(String sessionId) async {
+    final response = await http.get(
+      _uri('/admin/sessions/$sessionId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
   Future<Map<String, dynamic>> getDashboardStats() async {
-    try {
-      final uri = Uri.parse("$cloudUrl/admin/stats");
-      final response = await http.get(uri);
+    final response = await http.get(_uri('/admin/stats'), headers: _headers);
+    return _decodeMap(response);
+  }
 
-      if (response.statusCode == 200) {
-        return jsonDecode(response.body);
-      }
-      return {};
-    } catch (e) {
-      print("Stats error: $e");
-      return {};
+  Future<List<dynamic>> getEvents() async {
+    final response = await http.get(_uri('/admin/events'), headers: _headers);
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> terminateSession(String sessionId) async {
+    final response = await http.post(
+      _uri('/admin/session/$sessionId/terminate'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> flagSession(String sessionId) async {
+    final response = await http.post(
+      _uri('/admin/session/$sessionId/flag'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> approveRejoin(String sessionId) async {
+    final response = await http.post(
+      _uri('/admin/session/$sessionId/approve-rejoin'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> denyRejoin(String sessionId) async {
+    final response = await http.post(
+      _uri('/admin/session/$sessionId/deny-rejoin'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  String getStreamUrl(String sessionId) => '$baseUrl/admin/stream/$sessionId';
+
+  String getSideStreamUrl(String sessionId) =>
+      '$baseUrl/admin/stream/$sessionId/side';
+
+  String getSnapshotUrl(String sessionId, int cacheKey) =>
+      '$baseUrl/admin/snapshot/$sessionId?t=$cacheKey';
+
+  String getSideSnapshotUrl(String sessionId, int cacheKey) =>
+      '$baseUrl/admin/snapshot/$sessionId/side?t=$cacheKey';
+
+  String adminWebSocketUrl() => _ws('/ws/admin');
+
+  String sessionWebSocketUrl(String sessionId) => _ws('/ws/session/$sessionId');
+
+  String _ws(String path) {
+    final base = Uri.parse(baseUrl);
+    final scheme = base.scheme == 'https' ? 'wss' : 'ws';
+    final uri = base.replace(
+      scheme: scheme,
+      path: path,
+      queryParameters: {
+        if (token != null && token!.isNotEmpty) 'token': token!,
+      },
+    );
+    return uri.toString();
+  }
+
+  Map<String, dynamic> _decodeMap(http.Response response) {
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      if (response.body.isEmpty) return {};
+      return jsonDecode(response.body) as Map<String, dynamic>;
+    }
+    throw ApiException(_errorMessage(response.body), response.statusCode);
+  }
+
+  List<dynamic> _decodeList(http.Response response) {
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return jsonDecode(response.body) as List<dynamic>;
+    }
+    throw ApiException(_errorMessage(response.body), response.statusCode);
+  }
+
+  String _errorMessage(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      final detail = decoded is Map<String, dynamic> ? decoded['detail'] : null;
+      return detail?.toString() ?? 'Request failed';
+    } catch (_) {
+      return body.isEmpty ? 'Request failed' : body;
     }
   }
-
-  // ─────────────────────────────────────────────
-  // VIDEO STREAM URL (FOR ADMIN UI — local server)
-  // ─────────────────────────────────────────────
-  String getStreamUrl(String sessionId) {
-    return "$baseUrl/admin/stream/$sessionId";
-  }
-
-  // ─────────────────────────────────────────────
-  // WEBSOCKET URL (FOR ADMIN DASHBOARD — cloud)
-  // ─────────────────────────────────────────────
-  static String get adminWebSocketUrl {
-    // Convert https:// → wss:// or http:// → ws://
-    final wsUrl = cloudUrl
-        .replaceFirst("https://", "wss://")
-        .replaceFirst("http://", "ws://");
-    return "$wsUrl/ws/admin";
-  }
-
-  // ─────────────────────────────────────────────
-  // STUBS (extend later)
-  // ─────────────────────────────────────────────
-  Future<void> login(String email, String password) async {}
-  Future<void> submitExam() async {}
 }

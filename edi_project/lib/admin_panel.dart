@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
-import 'api_service.dart';
+
+import 'app_state.dart';
 import 'video_screen.dart';
 
 class AdminPanel extends StatefulWidget {
@@ -12,190 +15,623 @@ class AdminPanel extends StatefulWidget {
   State<AdminPanel> createState() => _AdminPanelState();
 }
 
-class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
-  WebSocketChannel? channel;
+class _AdminPanelState extends State<AdminPanel> {
+  WebSocketChannel? _channel;
   Timer? _reconnectTimer;
+  bool _connected = false;
+  bool _loading = true;
+  String _subject = 'ALL';
 
-  // Stores sessions keyed by session_id
-  final Map<String, Map<String, dynamic>> sessions = {};
-
-  // Dashboard stats
-  int totalActive = 0;
-  int totalCheating = 0;
-  int totalHighRisk = 0;
+  final Map<String, Map<String, dynamic>> _sessions = {};
+  final List<Map<String, dynamic>> _events = [];
+  Map<String, dynamic> _stats = {
+    'total_active': 0,
+    'total_cheating': 0,
+    'total_high_risk': 0,
+    'total_submitted': 0,
+    'total_events': 0,
+  };
 
   @override
   void initState() {
     super.initState();
-    _fetchInitialSessions();
-    _connectWebSocket();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _loadDashboard();
+      _connect();
+    });
   }
 
-  // ─────────────────────────────────────────────
-  // FETCH INITIAL SESSION LIST (REST)
-  // ─────────────────────────────────────────────
-  Future<void> _fetchInitialSessions() async {
-    final api = ApiService();
+  Future<void> _loadDashboard() async {
+    setState(() => _loading = true);
+    final api = context.read<AppState>().api;
     try {
-      final list = await api.getSessions();
+      final sessions = await api.getSessions(subject: _subject);
       final stats = await api.getDashboardStats();
-
+      final events = await api.getEvents();
+      if (!mounted) return;
+      setState(() {
+        _sessions
+          ..clear()
+          ..addEntries(
+            sessions.map((item) {
+              final map = Map<String, dynamic>.from(item as Map);
+              return MapEntry(map['session_id'].toString(), map);
+            }),
+          );
+        _stats = stats;
+        _events
+          ..clear()
+          ..addAll(
+            events.map((item) => Map<String, dynamic>.from(item as Map)),
+          );
+      });
+    } catch (error) {
       if (mounted) {
-        setState(() {
-          for (final s in list) {
-            sessions[s["session_id"]] = Map<String, dynamic>.from(s);
-          }
-          totalActive = stats["total_active"] ?? 0;
-          totalCheating = stats["total_cheating"] ?? 0;
-          totalHighRisk = stats["total_high_risk"] ?? 0;
-        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Dashboard refresh failed: $error')),
+        );
       }
-    } catch (e) {
-      debugPrint("Initial fetch error: $e");
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
-  // ─────────────────────────────────────────────
-  // WEBSOCKET — REAL-TIME UPDATES
-  // ─────────────────────────────────────────────
-  void _connectWebSocket() {
+  void _connect() {
     try {
-      channel = WebSocketChannel.connect(
-        Uri.parse(ApiService.adminWebSocketUrl),
+      _channel?.sink.close();
+      _channel = WebSocketChannel.connect(
+        Uri.parse(context.read<AppState>().api.adminWebSocketUrl()),
       );
-
-      channel!.stream.listen(
+      setState(() => _connected = true);
+      _channel!.stream.listen(
         (data) {
-          final decoded = jsonDecode(data);
-
-          setState(() {
-            sessions[decoded["session_id"]] = Map<String, dynamic>.from(decoded);
-            _recalcStats();
-          });
+          final decoded = jsonDecode(data as String) as Map<String, dynamic>;
+          _handleRealtime(decoded);
         },
-        onError: (error) {
-          debugPrint("WebSocket Error: $error");
-          _scheduleReconnect();
-        },
-        onDone: () {
-          debugPrint("WebSocket closed. Reconnecting...");
-          _scheduleReconnect();
-        },
+        onError: (_) => _scheduleReconnect(),
+        onDone: _scheduleReconnect,
       );
-    } catch (e) {
-      debugPrint("WebSocket connect error: $e");
+    } catch (_) {
       _scheduleReconnect();
     }
   }
 
   void _scheduleReconnect() {
+    if (!mounted) return;
+    setState(() => _connected = false);
     _reconnectTimer?.cancel();
-    _reconnectTimer = Timer(const Duration(seconds: 3), () {
-      if (mounted) _connectWebSocket();
+    _reconnectTimer = Timer(const Duration(seconds: 3), _connect);
+  }
+
+  void _handleRealtime(Map<String, dynamic> data) {
+    final sessionId = data['session_id']?.toString();
+    if (sessionId == null) return;
+    final dataSubject = data['subject']?.toString();
+    if (_subject != 'ALL' && dataSubject != null && dataSubject != _subject) {
+      setState(() {
+        _sessions.remove(sessionId);
+        _recalculateStats();
+      });
+      return;
+    }
+    setState(() {
+      final merged = {...?_sessions[sessionId], ...data};
+      final current = merged['is_active'] == true ||
+          merged['approval_status'] == 'PENDING';
+      if (current) {
+        _sessions[sessionId] = merged;
+      } else {
+        _sessions.remove(sessionId);
+      }
+      final latest = data['latest_event'];
+      if (current && latest is Map) {
+        _events.insert(0, Map<String, dynamic>.from(latest));
+        if (_events.length > 80) _events.removeLast();
+      }
+      _recalculateStats();
     });
   }
 
-  void _recalcStats() {
-    totalActive = sessions.values.where((s) => s["is_active"] == true).length;
-    totalCheating = sessions.values
-        .where((s) => s["is_active"] == true && s["is_cheating"] == true)
-        .length;
-    totalHighRisk = sessions.values
-        .where((s) =>
-            s["is_active"] == true &&
-            (s["risk_level"] == "HIGH" || s["risk_level"] == "CRITICAL"))
-        .length;
+  void _recalculateStats() {
+    final values = _sessions.values;
+    _stats = {
+      'total_active': values.where((item) => item['is_active'] == true).length,
+      'total_cheating': values
+          .where(
+            (item) =>
+                item['is_active'] == true &&
+                (item['is_cheating'] == true || item['cheating'] == true),
+          )
+          .length,
+      'total_high_risk': values
+          .where(
+            (item) =>
+                item['risk_level'] == 'HIGH' ||
+                item['risk_level'] == 'CRITICAL',
+          )
+          .length,
+      'total_submitted': values
+          .where((item) => item['is_submitted'] == true)
+          .length,
+      'total_events': _events.length,
+    };
+  }
+
+  Future<void> _flag(String sessionId) async {
+    final result = await context.read<AppState>().api.flagSession(sessionId);
+    _handleRealtime({'session_id': sessionId, ...result});
+  }
+
+  Future<void> _terminate(String sessionId) async {
+    final result = await context.read<AppState>().api.terminateSession(
+      sessionId,
+    );
+    _handleRealtime({'session_id': sessionId, ...result});
+  }
+
+  Future<void> _approve(String sessionId) async {
+    final result = await context.read<AppState>().api.approveRejoin(sessionId);
+    _handleRealtime({'session_id': sessionId, ...result});
+  }
+
+  Future<void> _deny(String sessionId) async {
+    final result = await context.read<AppState>().api.denyRejoin(sessionId);
+    _handleRealtime({'session_id': sessionId, ...result});
   }
 
   @override
   void dispose() {
-    channel?.sink.close();
+    _channel?.sink.close();
     _reconnectTimer?.cancel();
     super.dispose();
   }
 
-  // ─────────────────────────────────────────────
-  // SORT: Cheating students → top, then by score
-  // ─────────────────────────────────────────────
-  List<MapEntry<String, Map<String, dynamic>>> _getSortedSessions() {
-    final entries = sessions.entries.toList();
-
-    entries.sort((a, b) {
-      final aCheating = a.value["is_cheating"] == true ? 1 : 0;
-      final bCheating = b.value["is_cheating"] == true ? 1 : 0;
-
-      // Cheating students first
-      if (aCheating != bCheating) return bCheating - aCheating;
-
-      // Then by cheat_score descending
-      final aScore = (a.value["cheat_score"] ?? 0.0) as num;
-      final bScore = (b.value["cheat_score"] ?? 0.0) as num;
-      if (aScore != bScore) return bScore.compareTo(aScore);
-
-      // Then by cheat_count descending
-      final aCount = (a.value["cheat_count"] ?? 0) as num;
-      final bCount = (b.value["cheat_count"] ?? 0) as num;
-      return bCount.compareTo(aCount);
-    });
-
-    return entries;
-  }
-
-  // ─────────────────────────────────────────────
-  // BUILD
-  // ─────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final sortedSessions = _getSortedSessions();
+    final sorted = _sessions.entries.toList()
+      ..sort((a, b) {
+        final scoreA = ((a.value['cheat_score'] ?? 0) as num).toDouble();
+        final scoreB = ((b.value['cheat_score'] ?? 0) as num).toDouble();
+        return scoreB.compareTo(scoreA);
+      });
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0F0F1A),
       appBar: AppBar(
-        title: const Text(
-          "🔴 LIVE PROCTOR DASHBOARD",
-          style: TextStyle(
-            fontWeight: FontWeight.w800,
-            letterSpacing: 1.2,
-          ),
-        ),
-        backgroundColor: const Color(0xFF161627),
-        foregroundColor: Colors.white,
-        elevation: 0,
+        title: const Text('Live Proctor Dashboard'),
         actions: [
+          _ConnectionChip(connected: _connected),
           IconButton(
+            tooltip: 'Refresh',
             icon: const Icon(Icons.refresh),
-            onPressed: _fetchInitialSessions,
-            tooltip: "Refresh",
+            onPressed: _loadDashboard,
           ),
           IconButton(
+            tooltip: 'Logout',
             icon: const Icon(Icons.logout),
-            onPressed: () => Navigator.pushReplacementNamed(context, '/'),
-            tooltip: "Logout",
+            onPressed: () async {
+              await context.read<AppState>().logout();
+              if (context.mounted) {
+                Navigator.pushReplacementNamed(context, '/login');
+              }
+            },
           ),
         ],
       ),
-      body: Column(
-        children: [
-          // ── Stats Bar ──
-          _buildStatsBar(),
-
-          // ── Session Grid ──
-          Expanded(
-            child: sortedSessions.isEmpty
-                ? _buildEmptyState()
-                : GridView.builder(
-                    padding: const EdgeInsets.all(16),
-                    itemCount: sortedSessions.length,
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                      crossAxisCount: 2,
-                      crossAxisSpacing: 16,
-                      mainAxisSpacing: 16,
-                      childAspectRatio: 0.75,
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : LayoutBuilder(
+              builder: (context, constraints) {
+                final wide = constraints.maxWidth >= 1100;
+                return Row(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: ListView(
+                        padding: const EdgeInsets.all(18),
+                        children: [
+                          _SubjectFilter(
+                            selected: _subject,
+                            onChanged: (value) {
+                              setState(() => _subject = value);
+                              _loadDashboard();
+                            },
+                          ),
+                          const SizedBox(height: 12),
+                          _StatsBar(stats: _stats),
+                          const SizedBox(height: 16),
+                          GridView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            itemCount: sorted.length,
+                            gridDelegate:
+                                SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: constraints.maxWidth > 1400
+                                      ? 3
+                                      : wide
+                                      ? 2
+                                      : 1,
+                                  crossAxisSpacing: 14,
+                                  mainAxisSpacing: 14,
+                                  childAspectRatio: 1.0,
+                                ),
+                            itemBuilder: (context, index) {
+                              final entry = sorted[index];
+                              return _CandidateCard(
+                                session: entry.value,
+                                onOpen: () => Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) =>
+                                        VideoScreen(sessionId: entry.key),
+                                  ),
+                                ),
+                                onFlag: () => _flag(entry.key),
+                                onTerminate: () => _terminate(entry.key),
+                                onApprove: () => _approve(entry.key),
+                                onDeny: () => _deny(entry.key),
+                              );
+                            },
+                          ),
+                          if (sorted.isEmpty) const _EmptyDashboard(),
+                        ],
+                      ),
                     ),
+                    if (wide)
+                      SizedBox(width: 360, child: _EventLog(events: _events)),
+                  ],
+                );
+              },
+            ),
+      bottomSheet: MediaQuery.of(context).size.width < 1100
+          ? SizedBox(height: 190, child: _EventLog(events: _events))
+          : null,
+    );
+  }
+}
+
+class _StatsBar extends StatelessWidget {
+  const _StatsBar({required this.stats});
+
+  final Map<String, dynamic> stats;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 12,
+      runSpacing: 12,
+      children: [
+        _StatTile(
+          icon: Icons.people,
+          label: 'Active',
+          value: '${stats['total_active'] ?? 0}',
+          color: Colors.cyanAccent,
+        ),
+        _StatTile(
+          icon: Icons.warning_amber,
+          label: 'Cheating',
+          value: '${stats['total_cheating'] ?? 0}',
+          color: Colors.redAccent,
+        ),
+        _StatTile(
+          icon: Icons.shield,
+          label: 'High risk',
+          value: '${stats['total_high_risk'] ?? 0}',
+          color: Colors.orangeAccent,
+        ),
+        _StatTile(
+          icon: Icons.task_alt,
+          label: 'Submitted',
+          value: '${stats['total_submitted'] ?? 0}',
+          color: Colors.greenAccent,
+        ),
+      ],
+    );
+  }
+}
+
+class _SubjectFilter extends StatelessWidget {
+  const _SubjectFilter({required this.selected, required this.onChanged});
+
+  final String selected;
+  final ValueChanged<String> onChanged;
+
+  static const subjects = [
+    ('ALL', 'All subjects'),
+    ('CS', 'Computer Science'),
+    ('AI', 'AI and Ethics'),
+    ('SEC', 'Digital Security'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: SegmentedButton<String>(
+        segments: [
+          for (final subject in subjects)
+            ButtonSegment(
+              value: subject.$1,
+              label: Text(subject.$2),
+              icon: const Icon(Icons.menu_book),
+            ),
+        ],
+        selected: {selected},
+        onSelectionChanged: (value) => onChanged(value.first),
+      ),
+    );
+  }
+}
+
+class _StatTile extends StatelessWidget {
+  const _StatTile({
+    required this.icon,
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 180,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F172A),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: color),
+          const SizedBox(width: 10),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                value,
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  color: color,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              Text(label, style: const TextStyle(color: Colors.white60)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CandidateCard extends StatelessWidget {
+  const _CandidateCard({
+    required this.session,
+    required this.onOpen,
+    required this.onFlag,
+    required this.onTerminate,
+    required this.onApprove,
+    required this.onDeny,
+  });
+
+  final Map<String, dynamic> session;
+  final VoidCallback onOpen;
+  final VoidCallback onFlag;
+  final VoidCallback onTerminate;
+  final VoidCallback onApprove;
+  final VoidCallback onDeny;
+
+  @override
+  Widget build(BuildContext context) {
+    final risk = (session['risk_level'] ?? 'LOW').toString();
+    final color = risk == 'CRITICAL' || risk == 'HIGH'
+        ? Colors.redAccent
+        : risk == 'MEDIUM'
+        ? Colors.orangeAccent
+        : Colors.greenAccent;
+    final score = ((session['cheat_score'] ?? 0) as num).toDouble();
+    final active = session['is_active'] == true;
+    final pending = session['approval_status'] == 'PENDING';
+
+    return Card(
+      child: InkWell(
+        onTap: onOpen,
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: color.withValues(alpha: 0.15),
+                    child: Icon(
+                      active ? Icons.person : Icons.person_off,
+                      color: color,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          (session['student_name'] ?? 'Candidate').toString(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontWeight: FontWeight.w800),
+                        ),
+                        Text(
+                          (session['exam_title'] ?? 'Exam').toString(),
+                          style: const TextStyle(color: Colors.white60),
+                        ),
+                        Text(
+                          'Subject ${session['subject'] ?? 'GENERAL'}',
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  _RiskBadge(risk: risk, color: color),
+                ],
+              ),
+              const SizedBox(height: 14),
+              LinearProgressIndicator(
+                value: score / 100,
+                color: color,
+                backgroundColor: Colors.white10,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Cheating probability ${score.toStringAsFixed(0)}%',
+                style: TextStyle(color: color, fontWeight: FontWeight.w800),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                (session['message'] ?? session['cheat_message'] ?? 'Clear')
+                    .toString(),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Cheat type: ${session['cheat_type']?.toString().isNotEmpty == true ? session['cheat_type'] : 'None'}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white60,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                'Side cam: ${session['side_camera_status'] ?? 'UNKNOWN'}',
+                style: TextStyle(
+                  color: session['side_camera_status'] == 'ONLINE'
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const Spacer(),
+              pending
+                  ? Row(
+                      children: [
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: onApprove,
+                            icon: const Icon(Icons.check),
+                            label: const Text('Allow'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: onDeny,
+                            icon: const Icon(Icons.close),
+                            label: const Text('Deny'),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        _TinyMetric(
+                          label: 'Warnings',
+                          value: '${session['warning_count'] ?? 0}',
+                        ),
+                        const SizedBox(width: 10),
+                        _TinyMetric(
+                          label: 'Tabs',
+                          value: '${session['tab_switch_count'] ?? 0}',
+                        ),
+                        const Spacer(),
+                        IconButton(
+                          tooltip: 'Open feed',
+                          onPressed: onOpen,
+                          icon: const Icon(Icons.videocam),
+                        ),
+                        IconButton(
+                          tooltip: 'Flag',
+                          onPressed: onFlag,
+                          icon: const Icon(Icons.flag),
+                        ),
+                        IconButton(
+                          tooltip: 'Terminate',
+                          onPressed: active ? onTerminate : null,
+                          icon: const Icon(Icons.stop_circle),
+                        ),
+                      ],
+                    ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _EventLog extends StatelessWidget {
+  const _EventLog({required this.events});
+
+  final List<Map<String, dynamic>> events;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: const Color(0xFF0B1020),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(14),
+            child: Text(
+              'Activity Logs',
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+            ),
+          ),
+          Expanded(
+            child: events.isEmpty
+                ? const Center(
+                    child: Text(
+                      'No events yet',
+                      style: TextStyle(color: Colors.white38),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+                    itemCount: events.length,
+                    separatorBuilder: (context, index) =>
+                        const Divider(height: 1),
                     itemBuilder: (context, index) {
-                      final entry = sortedSessions[index];
-                      return _buildSessionCard(entry.key, entry.value);
+                      final event = events[index];
+                      return ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          Icons.bolt,
+                          color: _eventColor(event['severity']?.toString()),
+                        ),
+                        title: Text(
+                          event['message']?.toString() ?? 'Event',
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: Text(
+                          '${event['session_id'] ?? ''} - ${event['event_type'] ?? ''}',
+                        ),
+                      );
                     },
                   ),
           ),
@@ -204,384 +640,102 @@ class _AdminPanelState extends State<AdminPanel> with TickerProviderStateMixin {
     );
   }
 
-  // ─────────────────────────────────────────────
-  // STATS BAR
-  // ─────────────────────────────────────────────
-  Widget _buildStatsBar() {
-    return Container(
-      margin: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-      decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFF1E1E36), Color(0xFF252547)],
+  Color _eventColor(String? severity) {
+    return switch (severity) {
+      'CRITICAL' || 'HIGH' => Colors.redAccent,
+      'MEDIUM' => Colors.orangeAccent,
+      _ => Colors.cyanAccent,
+    };
+  }
+}
+
+class _ConnectionChip extends StatelessWidget {
+  const _ConnectionChip({required this.connected});
+
+  final bool connected;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = connected ? Colors.greenAccent : Colors.orangeAccent;
+    return Center(
+      child: Container(
+        margin: const EdgeInsets.only(right: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(30),
+          border: Border.all(color: color.withValues(alpha: 0.35)),
         ),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white10),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
-        children: [
-          _statChip(Icons.people, "$totalActive", "Active", Colors.cyanAccent),
-          _statChip(Icons.warning_amber_rounded, "$totalCheating", "Cheating",
-              Colors.redAccent),
-          _statChip(
-              Icons.shield, "$totalHighRisk", "High Risk", Colors.orangeAccent),
-        ],
+        child: Text(
+          connected ? 'Realtime' : 'Reconnecting',
+          style: TextStyle(color: color, fontWeight: FontWeight.w800),
+        ),
       ),
     );
   }
+}
 
-  Widget _statChip(IconData icon, String value, String label, Color color) {
-    return Column(
-      children: [
-        Row(
-          children: [
-            Icon(icon, color: color, size: 20),
-            const SizedBox(width: 6),
-            Text(
-              value,
-              style: TextStyle(
-                color: color,
-                fontSize: 22,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ],
+class _RiskBadge extends StatelessWidget {
+  const _RiskBadge({required this.risk, required this.color});
+
+  final String risk;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(30),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Text(
+        risk,
+        style: TextStyle(
+          color: color,
+          fontSize: 12,
+          fontWeight: FontWeight.w800,
         ),
-        const SizedBox(height: 4),
+      ),
+    );
+  }
+}
+
+class _TinyMetric extends StatelessWidget {
+  const _TinyMetric({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(value, style: const TextStyle(fontWeight: FontWeight.w900)),
         Text(
           label,
-          style: const TextStyle(color: Colors.white54, fontSize: 12),
+          style: const TextStyle(color: Colors.white54, fontSize: 11),
         ),
       ],
     );
   }
-
-  // ─────────────────────────────────────────────
-  // EMPTY STATE
-  // ─────────────────────────────────────────────
-  Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.monitor_heart_outlined,
-              size: 64, color: Colors.white24),
-          const SizedBox(height: 16),
-          const Text(
-            "Waiting for exam sessions...",
-            style: TextStyle(
-              fontSize: 18,
-              color: Colors.white38,
-            ),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            "Students will appear here when they start an exam",
-            style: TextStyle(fontSize: 13, color: Colors.white24),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ─────────────────────────────────────────────
-  // SESSION CARD — with animated cheating glow
-  // ─────────────────────────────────────────────
-  Widget _buildSessionCard(String sessionId, Map<String, dynamic> session) {
-    final isCheating = session["is_cheating"] ?? false;
-    final riskLevel = session["risk_level"] ?? "LOW";
-    final studentName = session["student_name"] ?? "Unknown";
-    final studentId = session["student_id"] ?? sessionId;
-    final examTitle = session["exam_title"] ?? "Exam";
-    final cheatCount = session["cheat_count"] ?? 0;
-    final cheatScore = (session["cheat_score"] ?? 0.0).toDouble();
-    final cheatMessage = session["cheat_message"] ?? "Clear";
-    final cheatType = session["cheat_type"] ?? "";
-
-    // ── Determine colors based on state ──
-    Color borderColor;
-    Color glowColor;
-    Color badgeColor;
-    String statusText;
-    IconData statusIcon;
-
-    if (isCheating) {
-      borderColor = Colors.red;
-      glowColor = Colors.red.withValues(alpha: 0.5);
-      badgeColor = Colors.red;
-      statusText = "⚠ CHEATING";
-      statusIcon = Icons.warning_rounded;
-    } else if (riskLevel == "HIGH" || riskLevel == "CRITICAL") {
-      borderColor = Colors.orange;
-      glowColor = Colors.orange.withValues(alpha: 0.3);
-      badgeColor = Colors.orange;
-      statusText = "⚡ HIGH RISK";
-      statusIcon = Icons.shield;
-    } else if (riskLevel == "MEDIUM") {
-      borderColor = Colors.amber;
-      glowColor = Colors.transparent;
-      badgeColor = Colors.amber;
-      statusText = "● MEDIUM";
-      statusIcon = Icons.info_outline;
-    } else {
-      borderColor = Colors.green;
-      glowColor = Colors.transparent;
-      badgeColor = Colors.green;
-      statusText = "✓ CLEAR";
-      statusIcon = Icons.verified;
-    }
-
-    return GestureDetector(
-      onTap: () {
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => VideoScreen(sessionId: sessionId),
-          ),
-        );
-      },
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 400),
-        curve: Curves.easeInOut,
-        decoration: BoxDecoration(
-          color: const Color(0xFF1A1A2E),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(
-            color: borderColor,
-            width: isCheating ? 3.0 : 2.0,
-          ),
-          boxShadow: [
-            if (isCheating)
-              BoxShadow(
-                color: glowColor,
-                blurRadius: 20,
-                spreadRadius: 4,
-              ),
-            if (riskLevel == "HIGH" || riskLevel == "CRITICAL")
-              BoxShadow(
-                color: glowColor,
-                blurRadius: 14,
-                spreadRadius: 2,
-              ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // ── Top badge ──
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              decoration: BoxDecoration(
-                color: badgeColor.withValues(alpha: 0.15),
-                borderRadius: const BorderRadius.vertical(
-                  top: Radius.circular(14),
-                ),
-              ),
-              child: Row(
-                children: [
-                  Icon(statusIcon, color: badgeColor, size: 18),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      statusText,
-                      style: TextStyle(
-                        color: badgeColor,
-                        fontWeight: FontWeight.w800,
-                        fontSize: 12,
-                        letterSpacing: 0.8,
-                      ),
-                    ),
-                  ),
-                  if (cheatCount > 0)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.red.withValues(alpha: 0.2),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Text(
-                        "$cheatCount",
-                        style: const TextStyle(
-                          color: Colors.redAccent,
-                          fontSize: 11,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-
-            // ── Center icon area ──
-            Expanded(
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    // Animated cheating indicator
-                    isCheating
-                        ? _CheatingPulse(color: borderColor)
-                        : Icon(
-                            Icons.person,
-                            color: borderColor.withValues(alpha: 0.6),
-                            size: 48,
-                          ),
-                    const SizedBox(height: 8),
-                    // Student name
-                    Text(
-                      studentName,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 15,
-                      ),
-                      textAlign: TextAlign.center,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    const SizedBox(height: 2),
-                    Text(
-                      "ID: $studentId",
-                      style: const TextStyle(
-                        color: Colors.white38,
-                        fontSize: 11,
-                      ),
-                    ),
-                    if (isCheating && cheatType.isNotEmpty) ...[
-                      const SizedBox(height: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 10, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: Colors.red.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(
-                              color: Colors.red.withValues(alpha: 0.3)),
-                        ),
-                        child: Text(
-                          cheatType,
-                          style: const TextStyle(
-                            color: Colors.redAccent,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 1,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-
-            // ── Bottom info bar ──
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: borderColor.withValues(alpha: 0.12),
-                borderRadius: const BorderRadius.vertical(
-                  bottom: Radius.circular(14),
-                ),
-              ),
-              child: Column(
-                children: [
-                  Text(
-                    examTitle,
-                    style: const TextStyle(
-                      color: Colors.white70,
-                      fontWeight: FontWeight.w600,
-                      fontSize: 12,
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  const SizedBox(height: 4),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        cheatMessage,
-                        style: TextStyle(
-                          color: isCheating ? Colors.redAccent : Colors.white38,
-                          fontSize: 11,
-                          fontWeight: isCheating
-                              ? FontWeight.bold
-                              : FontWeight.normal,
-                        ),
-                      ),
-                      Text(
-                        "Score: ${cheatScore.toStringAsFixed(0)}",
-                        style: TextStyle(
-                          color: cheatScore > 100
-                              ? Colors.orangeAccent
-                              : Colors.white30,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
-
-// ─────────────────────────────────────────────
-// ANIMATED PULSING ICON FOR CHEATING STUDENTS
-// ─────────────────────────────────────────────
-class _CheatingPulse extends StatefulWidget {
-  final Color color;
-  const _CheatingPulse({required this.color});
-
-  @override
-  State<_CheatingPulse> createState() => _CheatingPulseState();
-}
-
-class _CheatingPulseState extends State<_CheatingPulse>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-  late Animation<double> _animation;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 800),
-    )..repeat(reverse: true);
-
-    _animation = Tween<double>(begin: 0.7, end: 1.0).animate(
-      CurvedAnimation(parent: _controller, curve: Curves.easeInOut),
-    );
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
+class _EmptyDashboard extends StatelessWidget {
+  const _EmptyDashboard();
 
   @override
   Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _animation,
-      builder: (context, child) {
-        return Transform.scale(
-          scale: _animation.value,
-          child: Icon(
-            Icons.warning_rounded,
-            color: widget.color,
-            size: 52,
-          ),
-        );
-      },
+    return const Padding(
+      padding: EdgeInsets.all(60),
+      child: Center(
+        child: Text(
+          'Waiting for active candidate sessions...',
+          style: TextStyle(color: Colors.white54),
+        ),
+      ),
     );
   }
 }

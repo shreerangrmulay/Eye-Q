@@ -1,4 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+
+import 'app_state.dart';
 
 class AuthScreen extends StatefulWidget {
   const AuthScreen({super.key});
@@ -8,109 +11,217 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
-  // 1. Form Key and Controllers
   final _formKey = GlobalKey<FormState>();
-  final TextEditingController _emailController = TextEditingController();
-  final TextEditingController _passwordController = TextEditingController();
+  final _usernameController = TextEditingController(text: 'candidate');
+  final _passwordController = TextEditingController(text: 'student123');
+  final _sideCameraController = TextEditingController();
+  bool _rememberMe = true;
+  bool _loading = false;
+  bool _obscure = true;
+  String _role = 'candidate';
+  String? _error;
+  bool _prefilledSideCamera = false;
 
-  // 2. Mock Login Logic
-  void _handleLogin(String role) {
-    if (_formKey.currentState!.validate()) {
-      // Basic feedback before navigating
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Logging in as $role...')),
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_prefilledSideCamera) {
+      _sideCameraController.text = context.read<AppState>().sideCameraUrl;
+      _prefilledSideCamera = true;
+    }
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    try {
+      await context.read<AppState>().login(
+        username: _usernameController.text.trim(),
+        password: _passwordController.text,
+        role: _role,
+        rememberMe: _rememberMe,
+        sideCameraUrl: _role == 'candidate'
+            ? _sideCameraController.text.trim()
+            : '',
       );
-
-      // 3. Routing based on role
-      if (role == 'Student') {
-        Navigator.pushReplacementNamed(context, '/student_home');
-      } else {
-        Navigator.pushReplacementNamed(context, '/admin_home');
+      if (!mounted) return;
+      final state = context.read<AppState>();
+      Navigator.pushReplacementNamed(
+        context,
+        state.isAdmin ? '/admin_home' : '/student_home',
+      );
+    } catch (error) {
+      if (mounted) {
+        setState(
+          () => _error = error.toString().replaceFirst('Exception: ', ''),
+        );
       }
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-
     return Scaffold(
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 32.0),
-          child: Form(
-            key: _formKey, // Attach the validation key
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.lock_person_rounded, size: 80, color: colorScheme.primary),
-                const SizedBox(height: 20),
-                Text(
-                  "ProctorAI Secure Login",
-                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 40),
-
-                // Email Field
-                TextFormField(
-                  controller: _emailController,
-                  decoration: const InputDecoration(
-                    labelText: 'Institutional Email',
-                    prefixIcon: Icon(Icons.email_outlined),
-                    border: OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.isEmpty) return 'Please enter your email';
-                    if (!value.contains('@')) return 'Enter a valid email address';
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 16),
-
-                // Password Field
-                TextFormField(
-                  controller: _passwordController,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Password',
-                    prefixIcon: Icon(Icons.password_outlined),
-                    border: OutlineInputBorder(),
-                  ),
-                  validator: (value) {
-                    if (value == null || value.isEmpty) return 'Please enter your password';
-                    if (value.length < 6) return 'Password must be at least 6 characters';
-                    return null;
-                  },
-                ),
-                const SizedBox(height: 32),
-
-                // Login as Student Button
-                SizedBox(
-                  width: double.infinity,
-                  height: 55,
-                  child: ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: colorScheme.primary,
-                      foregroundColor: colorScheme.onPrimary,
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF08111F), Color(0xFF0B1020), Color(0xFF111827)],
+          ),
+        ),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Icon(
+                          Icons.security_rounded,
+                          size: 56,
+                          color: Color(0xFF00E5FF),
+                        ),
+                        const SizedBox(height: 16),
+                        Text(
+                          'ProctorAI Secure Login',
+                          textAlign: TextAlign.center,
+                          style: Theme.of(context).textTheme.headlineSmall
+                              ?.copyWith(fontWeight: FontWeight.w800),
+                        ),
+                        const SizedBox(height: 24),
+                        SegmentedButton<String>(
+                          segments: const [
+                            ButtonSegment(
+                              value: 'candidate',
+                              label: Text('Candidate'),
+                              icon: Icon(Icons.person),
+                            ),
+                            ButtonSegment(
+                              value: 'admin',
+                              label: Text('Proctor'),
+                              icon: Icon(Icons.admin_panel_settings),
+                            ),
+                          ],
+                          selected: {_role},
+                          onSelectionChanged: (value) {
+                            final role = value.first;
+                            setState(() {
+                              _role = role;
+                              _usernameController.text = role == 'admin'
+                                  ? 'admin'
+                                  : 'candidate';
+                              _passwordController.text = role == 'admin'
+                                  ? 'admin123'
+                                  : 'student123';
+                            });
+                          },
+                        ),
+                        const SizedBox(height: 18),
+                        TextFormField(
+                          controller: _usernameController,
+                          textInputAction: TextInputAction.next,
+                          decoration: const InputDecoration(
+                            labelText: 'Email or username',
+                            prefixIcon: Icon(Icons.alternate_email),
+                          ),
+                          validator: (value) =>
+                              value == null || value.trim().length < 3
+                              ? 'Enter a valid username'
+                              : null,
+                        ),
+                        const SizedBox(height: 14),
+                        TextFormField(
+                          controller: _passwordController,
+                          obscureText: _obscure,
+                          onFieldSubmitted: (_) => _submit(),
+                          decoration: InputDecoration(
+                            labelText: 'Password',
+                            prefixIcon: const Icon(Icons.lock_outline),
+                            suffixIcon: IconButton(
+                              onPressed: () =>
+                                  setState(() => _obscure = !_obscure),
+                              icon: Icon(
+                                _obscure
+                                    ? Icons.visibility
+                                    : Icons.visibility_off,
+                              ),
+                            ),
+                          ),
+                          validator: (value) =>
+                              value == null || value.length < 6
+                              ? 'Password must be at least 6 characters'
+                              : null,
+                        ),
+                        if (_role == 'candidate') ...[
+                          const SizedBox(height: 14),
+                          TextFormField(
+                            controller: _sideCameraController,
+                            decoration: const InputDecoration(
+                              labelText: 'Side camera IP:PORT',
+                              hintText: '192.168.0.103:8080',
+                              prefixIcon: Icon(Icons.settings_input_antenna),
+                            ),
+                            validator: (value) {
+                              if (_role != 'candidate') return null;
+                              return value == null || value.trim().isEmpty
+                                  ? 'Enter your side camera IP'
+                                  : null;
+                            },
+                          ),
+                        ],
+                        const SizedBox(height: 8),
+                        CheckboxListTile(
+                          value: _rememberMe,
+                          onChanged: (value) =>
+                              setState(() => _rememberMe = value ?? false),
+                          contentPadding: EdgeInsets.zero,
+                          controlAffinity: ListTileControlAffinity.leading,
+                          title: const Text('Remember me'),
+                        ),
+                        if (_error != null) ...[
+                          const SizedBox(height: 6),
+                          _AlertText(message: _error!),
+                        ],
+                        const SizedBox(height: 16),
+                        FilledButton.icon(
+                          onPressed: _loading ? null : _submit,
+                          icon: _loading
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.login),
+                          label: Text(_loading ? 'Authenticating' : 'Sign in'),
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'Demo users: candidate / student123, admin / admin123',
+                          textAlign: TextAlign.center,
+                          style: Theme.of(context).textTheme.bodySmall
+                              ?.copyWith(color: Colors.white54),
+                        ),
+                      ],
                     ),
-                    onPressed: () => _handleLogin('Student'),
-                    child: const Text("LOGIN AS STUDENT"),
                   ),
                 ),
-                const SizedBox(height: 12),
-
-                // Login as Admin Button
-                SizedBox(
-                  width: double.infinity,
-                  height: 55,
-                  child: OutlinedButton(
-                    onPressed: () => _handleLogin('Admin'),
-                    child: const Text("LOGIN AS ADMIN"),
-                  ),
-                ),
-              ],
+              ),
             ),
           ),
         ),
@@ -120,8 +231,39 @@ class _AuthScreenState extends State<AuthScreen> {
 
   @override
   void dispose() {
-    _emailController.dispose();
+    _usernameController.dispose();
     _passwordController.dispose();
+    _sideCameraController.dispose();
     super.dispose();
+  }
+}
+
+class _AlertText extends StatelessWidget {
+  const _AlertText({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red.withValues(alpha: 0.12),
+        border: Border.all(color: Colors.redAccent.withValues(alpha: 0.45)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline, color: Colors.redAccent),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(color: Colors.redAccent),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
