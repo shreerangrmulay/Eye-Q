@@ -1,19 +1,12 @@
 import 'package:flutter/foundation.dart';
 
 class ApiConfig {
-  static const _configuredBaseUrl = String.fromEnvironment('API_BASE_URL');
-  static const _productionBaseUrl = String.fromEnvironment(
-    'PRODUCTION_API_BASE_URL',
+  static const _configuredBaseUrl = String.fromEnvironment(
+    'API_BASE_URL',
     defaultValue: 'https://edi-3792.onrender.com',
   );
 
-  static final String baseUrl = _normalizeBaseUrl(
-    _configuredBaseUrl.isNotEmpty
-        ? _configuredBaseUrl
-        : kReleaseMode
-        ? _productionBaseUrl
-        : _debugBaseUrl(),
-  );
+  static final String baseUrl = _normalizeBaseUrl(_configuredBaseUrl);
 
   static void logSelectedBackend() {
     debugPrint('ProctorAI backend URL: $baseUrl');
@@ -41,12 +34,5 @@ class ApiConfig {
 
   static String _normalizeBaseUrl(String value) {
     return value.trim().replaceFirst(RegExp(r'/$'), '');
-  }
-
-  static String _debugBaseUrl() {
-    final browserOrigin = Uri.base;
-    return browserOrigin
-        .replace(scheme: 'http', port: 8000, path: '', query: '', fragment: '')
-        .toString();
   }
 }

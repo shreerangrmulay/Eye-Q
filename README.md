@@ -36,8 +36,8 @@ flutter pub get
 flutter run -d chrome
 ```
 
-Flutter debug builds use the local backend by default. Override the backend for
-web builds with `--dart-define=API_BASE_URL=<backend-url>` when needed.
+Flutter builds use the deployed backend by default. Override the backend for
+local API work with `--dart-define=API_BASE_URL=<backend-url>` when needed.
 
 Demo users:
 
