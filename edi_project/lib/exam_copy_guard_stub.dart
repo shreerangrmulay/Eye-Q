@@ -1,0 +1,3 @@
+void enableExamCopyGuard() {}
+
+void disableExamCopyGuard() {}

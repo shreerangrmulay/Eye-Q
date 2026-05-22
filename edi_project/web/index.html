@@ -31,8 +31,99 @@
 
   <title>edi_project</title>
   <link rel="manifest" href="manifest.json">
+  <style>
+    html.exam-copy-guard-active,
+    html.exam-copy-guard-active body,
+    html.exam-copy-guard-active flt-glass-pane {
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+
+    html.exam-copy-guard-active img,
+    html.exam-copy-guard-active canvas {
+      user-drag: none;
+      -webkit-user-drag: none;
+      pointer-events: auto;
+    }
+
+    @media print {
+      html.exam-copy-guard-active body {
+        display: none !important;
+      }
+    }
+  </style>
 </head>
 <body>
+  <script>
+    (function () {
+      let active = false;
+
+      function isEditable(target) {
+        if (!target) return false;
+        const element = target.nodeType === Node.ELEMENT_NODE
+          ? target
+          : target.parentElement;
+        if (!element || !element.closest) return false;
+        return Boolean(element.closest('input, textarea, [contenteditable="true"]'));
+      }
+
+      function block(event) {
+        if (!active) return;
+        event.preventDefault();
+        event.stopPropagation();
+      }
+
+      function blockCopyEvent(event) {
+        if (!active) return;
+        block(event);
+      }
+
+      function blockKey(event) {
+        if (!active) return;
+        const key = (event.key || '').toLowerCase();
+        const command = event.ctrlKey || event.metaKey;
+        const blockedCommand = command && ['a', 'c', 'p', 's', 'u', 'v', 'x'].includes(key);
+        if (event.key === 'F12' || blockedCommand) {
+          block(event);
+          return;
+        }
+        if (!isEditable(event.target) && [' ', 'arrowup', 'arrowdown'].includes(key)) {
+          event.preventDefault();
+        }
+      }
+
+      function markImages() {
+        if (!active) return;
+        document.querySelectorAll('img').forEach((image) => {
+          image.setAttribute('draggable', 'false');
+        });
+      }
+
+      window.proctorExamGuardEnable = function () {
+        active = true;
+        document.documentElement.classList.add('exam-copy-guard-active');
+        markImages();
+      };
+
+      window.proctorExamGuardDisable = function () {
+        active = false;
+        document.documentElement.classList.remove('exam-copy-guard-active');
+      };
+
+      ['contextmenu', 'selectstart', 'copy', 'cut', 'paste', 'dragstart'].forEach((name) => {
+        document.addEventListener(name, blockCopyEvent, true);
+      });
+      document.addEventListener('keydown', blockKey, true);
+      window.addEventListener('beforeprint', function (event) {
+        if (active) block(event);
+      });
+      new MutationObserver(markImages).observe(document.documentElement, {
+        childList: true,
+        subtree: true
+      });
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

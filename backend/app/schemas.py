@@ -30,6 +30,7 @@ class TokenResponse(BaseModel):
 
 class SessionStartRequest(BaseModel):
     session_id: str
+    exam_id: Optional[int] = None
     student_id: str
     student_name: str = "Candidate"
     exam_title: str = "Secure Exam"
@@ -52,12 +53,46 @@ class DetectionResponse(BaseModel):
     events: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class StudentMonitoringResponse(BaseModel):
+    type: str = "monitoring"
+    session_id: str
+    student_id: str
+    student_name: str
+    subject: str
+    exam_title: str
+    side_camera_status: str = "UNKNOWN"
+    is_active: bool
+    is_submitted: bool
+    is_terminated: bool
+    status: str = "MONITORING"
+    candidate_status: str = "MONITORING"
+    approval_status: str = "NOT_REQUIRED"
+    approval_note: str = ""
+
+    class Config:
+        from_attributes = True
+
+
 class ProctorUpdateRequest(BaseModel):
     session_id: str
     cheating: bool
     cheat_type: str = ""
     message: str = "Clear"
     cheat_score_delta: float = 0.0
+
+
+class SideCameraValidationRequest(BaseModel):
+    camera_input: Optional[str] = None
+    side_camera_url: Optional[str] = None
+
+
+class SideCameraValidationResponse(BaseModel):
+    success: bool
+    message: str
+    side_camera_url: str = ""
+    resolved_url: str = ""
+    stream_type: str = "UNKNOWN"
+    state: str = "STREAM_FAILED"
 
 
 class ProctorSimpleResponse(BaseModel):
@@ -78,8 +113,167 @@ class SubmitExamRequest(BaseModel):
     reason: str = "submitted_by_candidate"
 
 
+class StudentProfileIn(BaseModel):
+    full_name: str = Field(..., min_length=2)
+    prn: str = Field(..., min_length=2)
+    branch: str = Field(..., min_length=1)
+    division: str = Field(..., min_length=1)
+    semester: str = Field(..., min_length=1)
+    year: str = Field(..., min_length=1)
+
+
+class StudentProfileOut(BaseModel):
+    id: int
+    user_id: int
+    full_name: str
+    prn: str
+    branch: str
+    division: str
+    semester: str
+    year: str
+    created_at: Optional[datetime]
+    updated_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class SubjectIn(BaseModel):
+    subject_name: str = Field(..., min_length=2)
+    subject_code: str = Field(..., min_length=1)
+    branch: str = Field(..., min_length=1)
+    semester: str = Field(..., min_length=1)
+    division: str = Field(..., min_length=1)
+
+
+class SubjectOut(BaseModel):
+    id: int
+    subject_name: str
+    subject_code: str
+    branch: str
+    semester: str
+    division: str
+    created_by_teacher_id: int
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class ExamIn(BaseModel):
+    title: str = Field(..., min_length=2)
+    subject_id: int
+    duration_minutes: int = Field(60, ge=1)
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    total_marks: float = Field(100.0, ge=0)
+    instructions: str = ""
+    is_published: bool = False
+
+
+class ExamOut(BaseModel):
+    id: int
+    title: str
+    subject_id: int
+    teacher_id: int
+    duration_minutes: int
+    start_time: Optional[datetime]
+    end_time: Optional[datetime]
+    total_marks: float
+    instructions: str
+    is_published: bool
+    created_at: Optional[datetime]
+    subject_name: str = ""
+    subject_code: str = ""
+    branch: str = ""
+    division: str = ""
+    semester: str = ""
+    question_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class QuestionImageOut(BaseModel):
+    id: int
+    exam_id: Optional[int] = None
+    subject: str = ""
+    exam_title: str = ""
+    original_filename: str = ""
+    content_type: str = "image/png"
+    sort_order: int = 0
+    question_number: int = 0
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class TeacherStudentOut(BaseModel):
+    id: int
+    user_id: int
+    username: str
+    email: str
+    full_name: str
+    prn: str
+    branch: str
+    division: str
+    semester: str
+    year: str
+
+
+class ResultOut(BaseModel):
+    id: int
+    student_id: int
+    exam_id: int
+    student_name: str
+    prn: str
+    branch: str
+    division: str
+    semester: str
+    year: str
+    subject: str
+    subject_code: str
+    exam_title: str
+    marks: float
+    total_marks: float
+    percentage: float
+    submitted_at: Optional[datetime]
+    ai_suspicion_score: float
+    violation_count: int
+    status: str
+
+
+class ViolationOut(BaseModel):
+    id: int
+    session_id: str
+    student_name: str
+    prn: str = ""
+    branch: str = ""
+    division: str = ""
+    subject: str = ""
+    exam_title: str = ""
+    event_type: str
+    severity: str
+    message: str
+    confidence: float
+    score_delta: float
+    screenshot_url: str = ""
+    created_at: Optional[datetime]
+
+
+class TeacherDashboardStats(BaseModel):
+    subjects: int
+    exams: int
+    published_exams: int
+    students: int
+    results: int
+    violations: int
+
+
 class SessionOut(BaseModel):
     session_id: str
+    exam_id: Optional[int] = None
     student_id: str
     student_name: str
     subject: str

@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'app_state.dart';
+import 'profile_screen.dart';
 import 'auth_screen.dart';
 import 'student_panel.dart';
 import 'admin_panel.dart';
+import 'teacher_dashboard.dart';
 
 void main() {
   runApp(const ProctorSystemApp());
@@ -45,6 +47,8 @@ class ProctorSystemApp extends StatelessWidget {
           '/login': (context) => const AuthScreen(),
           '/student_home': (context) => const StudentPanel(),
           '/admin_home': (context) => const AdminPanel(),
+          '/teacher_home': (context) => const TeacherDashboard(),
+          '/profile': (context) => const ProfileScreen(),
         },
       ),
     );
@@ -61,6 +65,15 @@ class _Gate extends StatelessWidget {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
     if (!state.isAuthenticated) return const AuthScreen();
-    return state.isAdmin ? const AdminPanel() : const StudentPanel();
+    if (state.isTeacher) return const TeacherDashboard();
+    if (state.isProctor) return const AdminPanel();
+    if (!state.isProfileComplete && state.isStudent) {
+      // Redirect students to complete profile before accessing dashboard
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Navigator.pushReplacementNamed(context, '/profile');
+      });
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return const StudentPanel();
   }
 }

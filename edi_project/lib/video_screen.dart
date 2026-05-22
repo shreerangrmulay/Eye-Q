@@ -61,23 +61,6 @@ class _VideoScreenState extends State<VideoScreen> {
           : LayoutBuilder(
               builder: (context, constraints) {
                 final wide = constraints.maxWidth >= 1000;
-                final feeds = [
-                  Expanded(
-                    child: _FeedPane(
-                      title: 'Front camera',
-                      sessionId: widget.sessionId,
-                      side: false,
-                    ),
-                  ),
-                  const SizedBox(width: 12, height: 12),
-                  Expanded(
-                    child: _FeedPane(
-                      title: 'Side camera',
-                      sessionId: widget.sessionId,
-                      side: true,
-                    ),
-                  ),
-                ];
                 return Padding(
                   padding: const EdgeInsets.all(16),
                   child: Column(
@@ -88,8 +71,46 @@ class _VideoScreenState extends State<VideoScreen> {
                       Expanded(
                         flex: 3,
                         child: wide
-                            ? Row(children: feeds)
-                            : Column(children: feeds),
+                            ? Row(
+                                children: [
+                                  Expanded(
+                                    child: _FeedPane(
+                                      title: 'Front camera',
+                                      sessionId: widget.sessionId,
+                                      side: false,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: _FeedPane(
+                                      title: 'Side camera',
+                                      sessionId: widget.sessionId,
+                                      side: true,
+                                    ),
+                                  ),
+                                ],
+                              )
+                            : ListView(
+                                children: [
+                                  SizedBox(
+                                    height: 280,
+                                    child: _FeedPane(
+                                      title: 'Front camera',
+                                      sessionId: widget.sessionId,
+                                      side: false,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 12),
+                                  SizedBox(
+                                    height: 280,
+                                    child: _FeedPane(
+                                      title: 'Side camera',
+                                      sessionId: widget.sessionId,
+                                      side: true,
+                                    ),
+                                  ),
+                                ],
+                              ),
                       ),
                       const SizedBox(height: 12),
                       Expanded(child: _MalpracticeLog(events: events)),
@@ -157,11 +178,12 @@ class _SnapshotFeed extends StatefulWidget {
 class _SnapshotFeedState extends State<_SnapshotFeed> {
   Timer? _timer;
   int _cacheKey = 0;
+  bool _hadFrame = false;
 
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(milliseconds: 700), (_) {
+    _timer = Timer.periodic(const Duration(milliseconds: 1500), (_) {
       if (mounted) setState(() => _cacheKey++);
     });
   }
@@ -176,21 +198,36 @@ class _SnapshotFeedState extends State<_SnapshotFeed> {
   Widget build(BuildContext context) {
     final api = context.read<AppState>().api;
     final String url;
-    if (kIsWeb && widget.side) {
-      url = api.getSideStreamUrl(widget.sessionId);
-    } else {
-      url = widget.side
-          ? api.getSideSnapshotUrl(widget.sessionId, _cacheKey)
-          : api.getSnapshotUrl(widget.sessionId, _cacheKey);
-    }
+    url = widget.side
+        ? api.getSideSnapshotUrl(widget.sessionId, _cacheKey)
+        : api.getSnapshotUrl(widget.sessionId, _cacheKey);
     return Image.network(
       url,
       fit: BoxFit.contain,
       gaplessPlayback: true,
-      webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
+      webHtmlElementStrategy: kIsWeb
+          ? WebHtmlElementStrategy.prefer
+          : WebHtmlElementStrategy.never,
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (frame != null || wasSynchronouslyLoaded) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && !_hadFrame) setState(() => _hadFrame = true);
+          });
+        }
+        return child;
+      },
+      loadingBuilder: (context, child, progress) {
+        if (progress == null) return child;
+        return Center(
+          child: Text(
+            _hadFrame ? 'Refreshing feed' : widget.emptyText,
+            textAlign: TextAlign.center,
+          ),
+        );
+      },
       errorBuilder: (context, error, stackTrace) => Center(
         child: Text(
-          widget.emptyText,
+          _hadFrame ? 'Feed reconnecting' : widget.emptyText,
           textAlign: TextAlign.center,
         ),
       ),

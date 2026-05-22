@@ -21,6 +21,7 @@ class Session(Base):
     __tablename__ = "sessions"
 
     session_id = Column(String, primary_key=True, index=True)
+    exam_id = Column(Integer, ForeignKey("exams.id"), nullable=True, index=True)
     student_id = Column(String, index=True)
     student_name = Column(String, default="Candidate")
     subject = Column(String, default="GENERAL", index=True)
@@ -47,6 +48,103 @@ class Session(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     submitted_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Teacher(Base):
+    __tablename__ = "teachers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=True, index=True)
+    full_name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    department = Column(String, default="")
+    employee_id = Column(String, unique=True, index=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class StudentProfile(Base):
+    __tablename__ = "student_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    prn = Column(String, unique=True, index=True, nullable=False)
+    branch = Column(String, default="", index=True)
+    division = Column(String, default="", index=True)
+    semester = Column(String, default="", index=True)
+    year = Column(String, default="", index=True)
+    full_name = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class Subject(Base):
+    __tablename__ = "subjects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_name = Column(String, nullable=False)
+    subject_code = Column(String, index=True, nullable=False)
+    branch = Column(String, default="", index=True)
+    semester = Column(String, default="", index=True)
+    division = Column(String, default="", index=True)
+    created_by_teacher_id = Column(Integer, ForeignKey("teachers.id"), index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Exam(Base):
+    __tablename__ = "exams"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id"), index=True, nullable=False)
+    teacher_id = Column(Integer, ForeignKey("teachers.id"), index=True, nullable=False)
+    duration_minutes = Column(Integer, default=60)
+    start_time = Column(DateTime(timezone=True), nullable=True)
+    end_time = Column(DateTime(timezone=True), nullable=True)
+    total_marks = Column(Float, default=100.0)
+    instructions = Column(Text, default="")
+    is_published = Column(Boolean, default=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class QuestionImage(Base):
+    __tablename__ = "question_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    exam_id = Column(Integer, ForeignKey("exams.id"), index=True, nullable=False)
+    image_path = Column(String, nullable=False)
+    original_filename = Column(String, default="")
+    content_type = Column(String, default="image/png")
+    question_number = Column(Integer, default=1, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Result(Base):
+    __tablename__ = "results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    exam_id = Column(Integer, ForeignKey("exams.id"), index=True, nullable=False)
+    score = Column(Float, default=0.0)
+    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    ai_suspicion_score = Column(Float, default=0.0)
+    violation_count = Column(Integer, default=0)
+    status = Column(String, default="SUBMITTED", index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ExamQuestionImage(Base):
+    __tablename__ = "exam_question_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject = Column(String, default="GENERAL", index=True)
+    exam_title = Column(String, default="Secure Exam", index=True)
+    original_filename = Column(String, default="")
+    stored_filename = Column(String, nullable=False)
+    content_type = Column(String, default="image/png")
+    sort_order = Column(Integer, default=0, index=True)
+    is_active = Column(Boolean, default=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 class Event(Base):

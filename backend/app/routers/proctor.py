@@ -6,13 +6,21 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from ..models import Event, Session as SessionModel, User
-from ..schemas import DetectionResponse, ProctorSimpleResponse, ProctorUpdateRequest
-from ..security import get_db, get_current_user
+from ..role_filter import admin_session_payload, broadcast_monitoring_update, is_staff_role, student_session_payload
+from ..schemas import (
+    DetectionResponse,
+    ProctorSimpleResponse,
+    ProctorUpdateRequest,
+    SideCameraValidationRequest,
+    SideCameraValidationResponse,
+)
+from ..security import get_db, get_current_user, require_role
 from ..services.ai_service import ai_service
-from ..services.side_camera import read_side_camera_frame
+from ..services.side_camera import read_side_camera_frame, test_camera_connection
 from ..state import clear_side_frame, manager, store_frame, store_side_frame
 
 router = APIRouter(prefix="/proctor", tags=["proctor"])
+side_camera_failures: dict[str, int] = {}
 
 
 def _risk(score: float) -> str:
@@ -26,38 +34,102 @@ def _risk(score: float) -> str:
 
 
 def _session_payload(session: SessionModel, message_type: str = "detection") -> dict:
-    return {
-        "type": message_type,
-        "session_id": session.session_id,
-        "student_id": session.student_id,
-        "student_name": session.student_name,
-        "subject": session.subject,
-        "exam_title": session.exam_title,
-        "side_camera_url": session.side_camera_url,
-        "side_camera_status": session.side_camera_status,
-        "is_active": session.is_active,
-        "is_submitted": session.is_submitted,
-        "is_terminated": session.is_terminated,
-        "is_cheating": session.is_cheating,
-        "cheating": session.is_cheating,
-        "status": session.status,
-        "candidate_status": session.status,
-        "risk_level": session.risk_level,
-        "cheat_type": session.cheat_type,
-        "cheat_message": session.cheat_message,
-        "message": session.cheat_message,
-        "cheat_count": session.cheat_count,
-        "warning_count": session.warning_count,
-        "tab_switch_count": session.tab_switch_count,
-        "disconnect_count": session.disconnect_count,
-        "confidence": session.confidence,
-        "cheat_score": session.cheat_score,
-        "approval_status": session.approval_status,
-        "approval_note": session.approval_note,
-    }
+    return admin_session_payload(session, message_type)
 
 
-@router.post("/upload-frame", response_model=DetectionResponse)
+def _student_response(session: SessionModel, message_type: str = "monitoring") -> dict:
+    return student_session_payload(session, message_type)
+
+
+def _authorize_session_access(session: SessionModel, user: User) -> None:
+    if not is_staff_role(user.role) and session.student_id != user.username:
+        raise HTTPException(status_code=403, detail="Candidate cannot access another student's session")
+
+
+@router.post("/validate-side-camera", response_model=SideCameraValidationResponse)
+async def validate_side_camera(
+    payload: SideCameraValidationRequest,
+    user: User = Depends(get_current_user),
+):
+    camera_input = (payload.camera_input or payload.side_camera_url or "").strip()
+    try:
+        ok, resolved_url, stream_type, frame = test_camera_connection(
+            camera_input,
+            timeout_seconds=3.0,
+        )
+    except ValueError as exc:
+        return SideCameraValidationResponse(
+            success=False,
+            message=str(exc),
+            state="INVALID_IP",
+        )
+
+    if not ok or frame is None or frame.size == 0:
+        return SideCameraValidationResponse(
+            success=False,
+            message="Unable to connect to side camera",
+            state="STREAM_FAILED",
+        )
+
+    encoded_ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not encoded_ok or not buffer.any():
+        return SideCameraValidationResponse(
+            success=False,
+            message="Unable to read a valid side camera frame",
+            side_camera_url=resolved_url,
+            resolved_url=resolved_url,
+            stream_type=stream_type,
+            state="CAMERA_OFFLINE",
+        )
+
+    return SideCameraValidationResponse(
+        success=True,
+        message="Camera connected",
+        side_camera_url=resolved_url,
+        resolved_url=resolved_url,
+        stream_type=stream_type,
+        state="ONLINE",
+    )
+
+
+@router.post("/side-camera/reconnect/{session_id}", response_model=SideCameraValidationResponse)
+async def reconnect_side_camera(
+    session_id: str,
+    payload: SideCameraValidationRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, user)
+
+    validation = await validate_side_camera(payload, user)
+    if not validation.success:
+        session.side_camera_status = validation.state
+        session.cheat_message = validation.message
+        db.commit()
+        db.refresh(session)
+        await manager.broadcast_admin(_session_payload(session, "side_camera_reconnect_failed"))
+        await manager.broadcast_session(session_id, _student_response(session, "side_camera_reconnect_failed"))
+        return validation
+
+    session.side_camera_url = validation.resolved_url or validation.side_camera_url
+    session.side_camera_status = "ONLINE"
+    session.cheat_message = "Side camera reconnected"
+    side_camera_failures[session_id] = 0
+    ok, side_frame = read_side_camera_frame(validation.resolved_url or validation.side_camera_url, timeout_seconds=2.0)
+    if ok:
+        encoded_ok, side_buffer = cv2.imencode(".jpg", side_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        store_side_frame(session_id, side_buffer.tobytes() if encoded_ok else b"")
+    db.commit()
+    db.refresh(session)
+    await manager.broadcast_admin(_session_payload(session, "side_camera_reconnected"))
+    await manager.broadcast_session(session_id, _student_response(session, "side_camera_reconnected"))
+    return validation
+
+
+@router.post("/upload-frame")
 async def upload_frame(
     session_id: str,
     file: UploadFile = File(...),
@@ -67,6 +139,7 @@ async def upload_frame(
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, user)
     if not session.is_active:
         raise HTTPException(status_code=409, detail=f"Session is {session.status}")
     if session.is_terminated or session.is_submitted:
@@ -84,6 +157,7 @@ async def upload_frame(
     if session.side_camera_url:
         side_ok, side_frame = read_side_camera_frame(session.side_camera_url)
         if side_ok:
+            side_camera_failures[session_id] = 0
             ok, side_buffer = cv2.imencode(".jpg", side_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             side_detection = ai_service.process_frame(f"{session_id}:side", side_frame, camera="side")
             store_side_frame(
@@ -101,6 +175,18 @@ async def upload_frame(
             ]
             session.side_camera_status = "ONLINE"
         else:
+            failures = side_camera_failures.get(session_id, 0) + 1
+            side_camera_failures[session_id] = failures
+            if failures < 12:
+                session.side_camera_status = "RECONNECTING"
+                session.cheat_message = "Side camera reconnecting"
+                db.commit()
+                db.refresh(session)
+                payload = _session_payload(session, "side_camera_reconnecting")
+                await manager.broadcast_admin(payload)
+                await manager.broadcast_session(session_id, _student_response(session, "side_camera_reconnecting"))
+                return payload if is_staff_role(user.role) else _student_response(session, "side_camera_reconnecting")
+
             clear_side_frame(session_id)
             session.side_camera_status = "OFFLINE"
             session.is_active = False
@@ -123,8 +209,8 @@ async def upload_frame(
             ))
             db.commit()
             db.refresh(session)
-            await manager.broadcast(session_id, _session_payload(session, "terminated"))
-            return DetectionResponse(
+            await broadcast_monitoring_update(manager, session, "terminated")
+            admin_response = DetectionResponse(
                 session_id=session_id,
                 cheating=True,
                 message=session.cheat_message,
@@ -143,7 +229,8 @@ async def upload_frame(
                     "confidence": 1.0,
                     "score_delta": 30,
                 }],
-            )
+            ).model_dump(mode="json")
+            return admin_response if is_staff_role(user.role) else _student_response(session, "terminated")
 
     all_events = detection.events + side_events
     chargeable_events = [event for event in all_events if event.get("chargeable", True) and event["score_delta"] > 0]
@@ -188,9 +275,10 @@ async def upload_frame(
 
     payload = _session_payload(session)
     payload["events"] = event_rows
-    await manager.broadcast(session_id, payload)
+    await manager.broadcast_admin(payload)
+    await manager.broadcast_session(session_id, _student_response(session))
 
-    return DetectionResponse(
+    admin_response = DetectionResponse(
         session_id=session_id,
         cheating=session.is_cheating,
         message=session.cheat_message,
@@ -203,7 +291,8 @@ async def upload_frame(
         candidate_status=session.status,
         side_camera_status=session.side_camera_status,
         events=event_rows,
-    )
+    ).model_dump(mode="json")
+    return admin_response if is_staff_role(user.role) else _student_response(session)
 
 
 @router.post("/side-camera/check/{session_id}")
@@ -215,11 +304,13 @@ async def check_side_camera(
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+    _authorize_session_access(session, user)
     if not session.is_active or session.is_submitted or session.is_terminated:
-        return _session_payload(session, "side_camera_check")
+        return _session_payload(session, "side_camera_check") if is_staff_role(user.role) else _student_response(session, "side_camera_check")
 
     ok, side_frame = read_side_camera_frame(session.side_camera_url, timeout_seconds=1.25)
     if ok:
+        side_camera_failures[session_id] = 0
         encoded_ok, side_buffer = cv2.imencode(".jpg", side_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         side_detection = ai_service.process_frame(f"{session_id}:side", side_frame, camera="side")
         store_side_frame(
@@ -231,11 +322,23 @@ async def check_side_camera(
         db.commit()
         db.refresh(session)
         payload = _session_payload(session, "side_camera_check")
-        await manager.broadcast(session_id, payload)
-        return payload
+        await manager.broadcast_admin(payload)
+        await manager.broadcast_session(session_id, _student_response(session, "side_camera_check"))
+        return payload if is_staff_role(user.role) else _student_response(session, "side_camera_check")
+
+    failures = side_camera_failures.get(session_id, 0) + 1
+    side_camera_failures[session_id] = failures
+    session.side_camera_status = "RECONNECTING" if failures < 12 else "OFFLINE"
+    if failures < 12:
+        session.cheat_message = "Side camera reconnecting"
+        db.commit()
+        db.refresh(session)
+        payload = _session_payload(session, "side_camera_reconnecting")
+        await manager.broadcast_admin(payload)
+        await manager.broadcast_session(session_id, _student_response(session, "side_camera_reconnecting"))
+        return payload if is_staff_role(user.role) else _student_response(session, "side_camera_reconnecting")
 
     clear_side_frame(session_id)
-    session.side_camera_status = "OFFLINE"
     session.is_active = False
     session.is_terminated = True
     session.is_cheating = True
@@ -257,14 +360,16 @@ async def check_side_camera(
     db.commit()
     db.refresh(session)
     payload = _session_payload(session, "terminated")
-    await manager.broadcast(session_id, payload)
-    return payload
+    await manager.broadcast_admin(payload)
+    await manager.broadcast_session(session_id, _student_response(session, "terminated"))
+    return payload if is_staff_role(user.role) else _student_response(session, "terminated")
 
 
 @router.post("/update", response_model=ProctorSimpleResponse)
 async def proctor_update(
     payload: ProctorUpdateRequest,
     db: Session = Depends(get_db),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == payload.session_id).first()
     if session is None:
@@ -295,5 +400,5 @@ async def proctor_update(
     db.commit()
     db.refresh(session)
 
-    await manager.broadcast(payload.session_id, _session_payload(session, "proctor_update"))
+    await broadcast_monitoring_update(manager, session, "proctor_update")
     return ProctorSimpleResponse(cheating=session.is_cheating, message=session.cheat_message)

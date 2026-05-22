@@ -4,8 +4,8 @@ from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session
 
 from .database import engine
-from .models import Base, Session as ExamSession, User
-from .routers import admin, auth, proctor, session
+from .models import Base, Exam, Session as ExamSession, Subject, Teacher, User
+from .routers import admin, auth, proctor, session, student, teacher
 from .security import get_db, hash_password
 
 app = FastAPI(
@@ -27,6 +27,7 @@ Base.metadata.create_all(bind=engine)
 
 def ensure_schema():
     additions = {
+        "exam_id": "INTEGER",
         "subject": "VARCHAR DEFAULT 'GENERAL'",
         "side_camera_url": "VARCHAR DEFAULT ''",
         "side_camera_status": "VARCHAR DEFAULT 'UNKNOWN'",
@@ -47,6 +48,8 @@ def seed_users():
     defaults = [
         ("candidate", "candidate@exam.ai", "Candidate Demo", "candidate", "student123"),
         ("student", "student@exam.ai", "Student Demo", "candidate", "student123"),
+        ("teacher", "teacher@exam.ai", "Faculty Demo", "teacher", "teacher123"),
+        ("proctor", "proctor@exam.ai", "Proctor Demo", "proctor", "proctor123"),
         ("admin", "admin@proctor.ai", "Proctor Admin", "admin", "admin123"),
     ]
     db = Session(bind=engine)
@@ -62,6 +65,84 @@ def seed_users():
                     password_hash=hash_password(password),
                 ))
         db.commit()
+
+        teacher_user = db.query(User).filter(User.username == "teacher").first()
+        if teacher_user is not None:
+            teacher_profile = db.query(Teacher).filter(Teacher.user_id == teacher_user.id).first()
+            if teacher_profile is None:
+                teacher_profile = Teacher(
+                    user_id=teacher_user.id,
+                    full_name=teacher_user.full_name,
+                    email=teacher_user.email,
+                    password_hash=teacher_user.password_hash,
+                    department="Computer Science",
+                    employee_id="FAC-1001",
+                )
+                db.add(teacher_profile)
+                db.commit()
+                db.refresh(teacher_profile)
+
+            if db.query(Subject).filter(Subject.created_by_teacher_id == teacher_profile.id).count() == 0:
+                subjects = [
+                    Subject(
+                        subject_name="Computer Science 101",
+                        subject_code="CS",
+                        branch="CSE",
+                        semester="1",
+                        division="A",
+                        created_by_teacher_id=teacher_profile.id,
+                    ),
+                    Subject(
+                        subject_name="AI and Ethics",
+                        subject_code="AI",
+                        branch="CSE",
+                        semester="1",
+                        division="A",
+                        created_by_teacher_id=teacher_profile.id,
+                    ),
+                    Subject(
+                        subject_name="Digital Security",
+                        subject_code="SEC",
+                        branch="CSE",
+                        semester="1",
+                        division="A",
+                        created_by_teacher_id=teacher_profile.id,
+                    ),
+                ]
+                db.add_all(subjects)
+                db.commit()
+                for subject in subjects:
+                    db.refresh(subject)
+                db.add_all([
+                    Exam(
+                        title="Computer Science 101",
+                        subject_id=subjects[0].id,
+                        teacher_id=teacher_profile.id,
+                        duration_minutes=60,
+                        total_marks=100,
+                        instructions="Answer all questions.",
+                        is_published=True,
+                    ),
+                    Exam(
+                        title="AI and Ethics",
+                        subject_id=subjects[1].id,
+                        teacher_id=teacher_profile.id,
+                        duration_minutes=45,
+                        total_marks=50,
+                        instructions="Use concise answers.",
+                        is_published=True,
+                    ),
+                    Exam(
+                        title="Digital Security",
+                        subject_id=subjects[2].id,
+                        teacher_id=teacher_profile.id,
+                        duration_minutes=30,
+                        total_marks=50,
+                        instructions="Do not leave the exam screen.",
+                        is_published=True,
+                    ),
+                ])
+                db.commit()
     finally:
         db.close()
 
@@ -69,8 +150,10 @@ seed_users()
 
 app.include_router(auth.router)
 app.include_router(session.router)
+app.include_router(student.router)
 app.include_router(proctor.router)
 app.include_router(admin.router)
+app.include_router(teacher.router)
 
 @app.get("/")
 def root(db: Session = Depends(get_db)):

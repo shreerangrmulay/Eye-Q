@@ -18,7 +18,7 @@ class _AuthScreenState extends State<AuthScreen> {
   bool _rememberMe = true;
   bool _loading = false;
   bool _obscure = true;
-  String _role = 'candidate';
+  String _role = 'student';
   String? _error;
   bool _prefilledSideCamera = false;
 
@@ -44,7 +44,7 @@ class _AuthScreenState extends State<AuthScreen> {
         password: _passwordController.text,
         role: _role,
         rememberMe: _rememberMe,
-        sideCameraUrl: _role == 'candidate'
+        sideCameraUrl: _role == 'student'
             ? _sideCameraController.text.trim()
             : '',
       );
@@ -52,7 +52,11 @@ class _AuthScreenState extends State<AuthScreen> {
       final state = context.read<AppState>();
       Navigator.pushReplacementNamed(
         context,
-        state.isAdmin ? '/admin_home' : '/student_home',
+        state.isTeacher
+            ? '/teacher_home'
+            : state.isProctor
+            ? '/admin_home'
+            : '/student_home',
       );
     } catch (error) {
       if (mounted) {
@@ -106,14 +110,24 @@ class _AuthScreenState extends State<AuthScreen> {
                         SegmentedButton<String>(
                           segments: const [
                             ButtonSegment(
-                              value: 'candidate',
-                              label: Text('Candidate'),
+                              value: 'student',
+                              label: Text('Student'),
                               icon: Icon(Icons.person),
                             ),
                             ButtonSegment(
-                              value: 'admin',
+                              value: 'teacher',
+                              label: Text('Teacher'),
+                              icon: Icon(Icons.co_present),
+                            ),
+                            ButtonSegment(
+                              value: 'proctor',
                               label: Text('Proctor'),
                               icon: Icon(Icons.admin_panel_settings),
+                            ),
+                            ButtonSegment(
+                              value: 'admin',
+                              label: Text('Admin'),
+                              icon: Icon(Icons.shield),
                             ),
                           ],
                           selected: {_role},
@@ -121,12 +135,19 @@ class _AuthScreenState extends State<AuthScreen> {
                             final role = value.first;
                             setState(() {
                               _role = role;
-                              _usernameController.text = role == 'admin'
-                                  ? 'admin'
-                                  : 'candidate';
-                              _passwordController.text = role == 'admin'
-                                  ? 'admin123'
-                                  : 'student123';
+                              if (role == 'teacher') {
+                                _usernameController.text = 'teacher';
+                                _passwordController.text = 'teacher123';
+                              } else if (role == 'proctor') {
+                                _usernameController.text = 'proctor';
+                                _passwordController.text = 'proctor123';
+                              } else if (role == 'admin') {
+                                _usernameController.text = 'admin';
+                                _passwordController.text = 'admin123';
+                              } else {
+                                _usernameController.text = 'candidate';
+                                _passwordController.text = 'student123';
+                              }
                             });
                           },
                         ),
@@ -166,7 +187,7 @@ class _AuthScreenState extends State<AuthScreen> {
                               ? 'Password must be at least 6 characters'
                               : null,
                         ),
-                        if (_role == 'candidate') ...[
+                        if (_role == 'student') ...[
                           const SizedBox(height: 14),
                           TextFormField(
                             controller: _sideCameraController,
@@ -176,7 +197,7 @@ class _AuthScreenState extends State<AuthScreen> {
                               prefixIcon: Icon(Icons.settings_input_antenna),
                             ),
                             validator: (value) {
-                              if (_role != 'candidate') return null;
+                              if (_role != 'student') return null;
                               return value == null || value.trim().isEmpty
                                   ? 'Enter your side camera IP'
                                   : null;
@@ -212,7 +233,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                         const SizedBox(height: 12),
                         Text(
-                          'Demo users: candidate / student123, admin / admin123',
+                          'Demo users: candidate / student123, teacher / teacher123, proctor / proctor123',
                           textAlign: TextAlign.center,
                           style: Theme.of(context).textTheme.bodySmall
                               ?.copyWith(color: Colors.white54),

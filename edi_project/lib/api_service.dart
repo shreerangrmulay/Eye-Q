@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 class ApiException implements Exception {
   final String message;
@@ -11,6 +12,30 @@ class ApiException implements Exception {
 
   @override
   String toString() => message;
+}
+
+class QuestionImageUpload {
+  const QuestionImageUpload({
+    required this.bytes,
+    required this.filename,
+    required this.contentType,
+  });
+
+  final Uint8List bytes;
+  final String filename;
+  final String contentType;
+}
+
+class ApiDownload {
+  const ApiDownload({
+    required this.bytes,
+    required this.filename,
+    required this.contentType,
+  });
+
+  final Uint8List bytes;
+  final String filename;
+  final String contentType;
 }
 
 class ApiService {
@@ -64,24 +89,28 @@ class ApiService {
 
   Future<Map<String, dynamic>> startSession({
     required String sessionId,
+    int? examId,
     required String studentId,
     required String studentName,
     required String examTitle,
     required String subject,
     required String sideCameraUrl,
   }) async {
-    final response = await http.post(
-      _uri('/session/start'),
-      headers: _headers,
-      body: jsonEncode({
-        'session_id': sessionId,
-        'student_id': studentId,
-        'student_name': studentName,
-        'exam_title': examTitle,
-        'subject': subject,
-        'side_camera_url': sideCameraUrl,
-      }),
-    );
+    final response = await http
+        .post(
+          _uri('/session/start'),
+          headers: _headers,
+          body: jsonEncode({
+            'session_id': sessionId,
+            if (examId != null) 'exam_id': examId,
+            'student_id': studentId,
+            'student_name': studentName,
+            'exam_title': examTitle,
+            'subject': subject,
+            'side_camera_url': sideCameraUrl,
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
     return _decodeMap(response);
   }
 
@@ -109,11 +138,344 @@ class ApiService {
     throw ApiException(_errorMessage(body), streamed.statusCode);
   }
 
-  Future<Map<String, dynamic>> checkSideCamera(String sessionId) async {
-    final response = await http.post(
-      _uri('/proctor/side-camera/check/$sessionId'),
+  Future<List<dynamic>> getQuestionImages({
+    int? examId,
+    String? subject,
+    String? examTitle,
+  }) async {
+    final response = await http.get(
+      _uri('/session/question-images', {
+        if (examId != null) 'exam_id': '$examId',
+        if (subject != null) 'subject': subject,
+        if (examTitle != null) 'exam_title': examTitle,
+      }),
       headers: _headers,
     );
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> getStudentProfile() async {
+    final response = await http.get(_uri('/student/profile'), headers: _headers);
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> updateStudentProfile({
+    required String fullName,
+    required String prn,
+    required String branch,
+    required String division,
+    required String semester,
+    required String year,
+  }) async {
+    final response = await http.put(
+      _uri('/student/profile'),
+      headers: _headers,
+      body: jsonEncode({
+        'full_name': fullName,
+        'prn': prn,
+        'branch': branch,
+        'division': division,
+        'semester': semester,
+        'year': year,
+      }),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> getAvailableExams() async {
+    final response = await http.get(_uri('/student/exams'), headers: _headers);
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> getTeacherSummary() async {
+    final response = await http.get(_uri('/teacher/summary'), headers: _headers);
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> getTeacherSubjects({
+    String? branch,
+    String? division,
+    String? semester,
+  }) async {
+    final response = await http.get(
+      _uri('/teacher/subjects', {
+        if (branch != null && branch.isNotEmpty) 'branch': branch,
+        if (division != null && division.isNotEmpty) 'division': division,
+        if (semester != null && semester.isNotEmpty) 'semester': semester,
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> createTeacherSubject(Map<String, dynamic> payload) async {
+    final response = await http.post(
+      _uri('/teacher/subjects'),
+      headers: _headers,
+      body: jsonEncode(payload),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> updateTeacherSubject(int subjectId, Map<String, dynamic> payload) async {
+    final response = await http.put(
+      _uri('/teacher/subjects/$subjectId'),
+      headers: _headers,
+      body: jsonEncode(payload),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> deleteTeacherSubject(int subjectId) async {
+    final response = await http.delete(
+      _uri('/teacher/subjects/$subjectId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> getTeacherExams({int? subjectId}) async {
+    final response = await http.get(
+      _uri('/teacher/exams', {
+        if (subjectId != null) 'subject_id': '$subjectId',
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> createTeacherExam(Map<String, dynamic> payload) async {
+    final response = await http.post(
+      _uri('/teacher/exams'),
+      headers: _headers,
+      body: jsonEncode(payload),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> updateTeacherExam(int examId, Map<String, dynamic> payload) async {
+    final response = await http.put(
+      _uri('/teacher/exams/$examId'),
+      headers: _headers,
+      body: jsonEncode(payload),
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> deleteTeacherExam(int examId) async {
+    final response = await http.delete(
+      _uri('/teacher/exams/$examId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> uploadTeacherQuestionImages({
+    required int examId,
+    required List<QuestionImageUpload> images,
+  }) async {
+    final request = http.MultipartRequest(
+      'POST',
+      _uri('/teacher/exams/$examId/question-images'),
+    );
+    if (token != null && token!.isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer $token';
+    }
+    for (final image in images) {
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'files',
+          image.bytes,
+          filename: image.filename,
+          contentType: _mediaType(image.contentType),
+        ),
+      );
+    }
+    final streamed = await request.send().timeout(const Duration(seconds: 30));
+    final body = await streamed.stream.bytesToString();
+    if (streamed.statusCode >= 200 && streamed.statusCode < 300) {
+      return jsonDecode(body) as List<dynamic>;
+    }
+    throw ApiException(_errorMessage(body), streamed.statusCode);
+  }
+
+  Future<Map<String, dynamic>> deleteTeacherQuestionImage(int imageId) async {
+    final response = await http.delete(
+      _uri('/teacher/question-images/$imageId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<List<dynamic>> getTeacherStudents({
+    String? branch,
+    String? division,
+    String? semester,
+    String? search,
+  }) async {
+    final response = await http.get(
+      _uri('/teacher/students', {
+        if (branch != null && branch.isNotEmpty) 'branch': branch,
+        if (division != null && division.isNotEmpty) 'division': division,
+        if (semester != null && semester.isNotEmpty) 'semester': semester,
+        if (search != null && search.isNotEmpty) 'search': search,
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<List<dynamic>> getTeacherResults({
+    int? subjectId,
+    String? branch,
+    String? division,
+    String? search,
+  }) async {
+    final response = await http.get(
+      _uri('/teacher/results', {
+        if (subjectId != null) 'subject_id': '$subjectId',
+        if (branch != null && branch.isNotEmpty) 'branch': branch,
+        if (division != null && division.isNotEmpty) 'division': division,
+        if (search != null && search.isNotEmpty) 'search': search,
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<List<dynamic>> getTeacherViolations({
+    int? subjectId,
+    String? branch,
+    String? division,
+    String? search,
+  }) async {
+    final response = await http.get(
+      _uri('/teacher/violations', {
+        if (subjectId != null) 'subject_id': '$subjectId',
+        if (branch != null && branch.isNotEmpty) 'branch': branch,
+        if (division != null && division.isNotEmpty) 'division': division,
+        if (search != null && search.isNotEmpty) 'search': search,
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<ApiDownload> downloadTeacherResultsExport({
+    required String format,
+    int? subjectId,
+    String? branch,
+    String? division,
+    String? search,
+  }) async {
+    final response = await http.get(
+      _uri('/teacher/results/export', {
+        'format': format,
+        if (subjectId != null) 'subject_id': '$subjectId',
+        if (branch != null && branch.isNotEmpty) 'branch': branch,
+        if (division != null && division.isNotEmpty) 'division': division,
+        if (search != null && search.isNotEmpty) 'search': search,
+      }),
+      headers: _headers,
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(_errorMessage(response.body), response.statusCode);
+    }
+    final extension = format == 'excel' ? 'xls' : 'csv';
+    return ApiDownload(
+      bytes: response.bodyBytes,
+      filename: 'exam-results.$extension',
+      contentType: response.headers['content-type'] ?? 'text/csv',
+    );
+  }
+
+  Future<List<dynamic>> getAdminQuestionImages({
+    String? subject,
+    String? examTitle,
+  }) async {
+    final response = await http.get(
+      _uri('/admin/question-images', {
+        if (subject != null && subject != 'ALL') 'subject': subject,
+        if (examTitle != null && examTitle.trim().isNotEmpty)
+          'exam_title': examTitle.trim(),
+      }),
+      headers: _headers,
+    );
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> uploadQuestionImage({
+    required Uint8List imageBytes,
+    required String filename,
+    required String contentType,
+    required String subject,
+    required String examTitle,
+    int? sortOrder,
+  }) async {
+    final request = http.MultipartRequest(
+      'POST',
+      _uri('/admin/question-images'),
+    );
+    if (token != null && token!.isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer $token';
+    }
+    request.fields['subject'] = subject;
+    request.fields['exam_title'] = examTitle;
+    if (sortOrder != null) request.fields['sort_order'] = '$sortOrder';
+    request.files.add(
+      http.MultipartFile.fromBytes(
+        'file',
+        imageBytes,
+        filename: filename,
+        contentType: _mediaType(contentType),
+      ),
+    );
+
+    final streamed = await request.send().timeout(const Duration(seconds: 20));
+    final body = await streamed.stream.bytesToString();
+    if (streamed.statusCode >= 200 && streamed.statusCode < 300) {
+      return jsonDecode(body) as Map<String, dynamic>;
+    }
+    throw ApiException(_errorMessage(body), streamed.statusCode);
+  }
+
+  Future<Map<String, dynamic>> deleteQuestionImage(int imageId) async {
+    final response = await http.delete(
+      _uri('/admin/question-images/$imageId'),
+      headers: _headers,
+    );
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> checkSideCamera(String sessionId) async {
+    final response = await http
+        .post(_uri('/proctor/side-camera/check/$sessionId'), headers: _headers)
+        .timeout(const Duration(seconds: 5));
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> validateSideCamera(String sideCameraUrl) async {
+    final response = await http
+        .post(
+          _uri('/proctor/validate-side-camera'),
+          headers: _headers,
+          body: jsonEncode({'camera_input': sideCameraUrl}),
+        )
+        .timeout(const Duration(seconds: 10));
+    return _decodeMap(response);
+  }
+
+  Future<Map<String, dynamic>> reconnectSideCamera({
+    required String sessionId,
+    required String sideCameraUrl,
+  }) async {
+    final response = await http
+        .post(
+          _uri('/proctor/side-camera/reconnect/$sessionId'),
+          headers: _headers,
+          body: jsonEncode({'camera_input': sideCameraUrl}),
+        )
+        .timeout(const Duration(seconds: 10));
     return _decodeMap(response);
   }
 
@@ -125,17 +487,19 @@ class ApiService {
     double scoreDelta = 0,
     Map<String, dynamic> metadata = const {},
   }) async {
-    final response = await http.post(
-      _uri('/session/$sessionId/event'),
-      headers: _headers,
-      body: jsonEncode({
-        'event_type': eventType,
-        'message': message,
-        'severity': severity,
-        'score_delta': scoreDelta,
-        'metadata': metadata,
-      }),
-    );
+    final response = await http
+        .post(
+          _uri('/session/$sessionId/event'),
+          headers: _headers,
+          body: jsonEncode({
+            'event_type': eventType,
+            'message': message,
+            'severity': severity,
+            'score_delta': scoreDelta,
+            'metadata': metadata,
+          }),
+        )
+        .timeout(const Duration(seconds: 8));
     return _decodeMap(response);
   }
 
@@ -144,11 +508,13 @@ class ApiService {
     required Map<String, String> answers,
     String reason = 'submitted_by_candidate',
   }) async {
-    final response = await http.post(
-      _uri('/session/$sessionId/submit'),
-      headers: _headers,
-      body: jsonEncode({'answers': answers, 'reason': reason}),
-    );
+    final response = await http
+        .post(
+          _uri('/session/$sessionId/submit'),
+          headers: _headers,
+          body: jsonEncode({'answers': answers, 'reason': reason}),
+        )
+        .timeout(const Duration(seconds: 18));
     return _decodeMap(response);
   }
 
@@ -223,6 +589,50 @@ class ApiService {
   String getSideSnapshotUrl(String sessionId, int cacheKey) =>
       '$baseUrl/admin/snapshot/$sessionId/side?t=$cacheKey';
 
+  String getStudentSideStreamUrl(String sessionId) {
+    final query = token != null && token!.isNotEmpty
+        ? '?token=${Uri.encodeQueryComponent(token!)}'
+        : '';
+    return '$baseUrl/session/$sessionId/side-stream$query';
+  }
+
+  String getStudentSideSnapshotUrl(String sessionId, int cacheKey) {
+    final query = {
+      't': '$cacheKey',
+      if (token != null && token!.isNotEmpty) 'token': token!,
+    };
+    return Uri.parse(
+      '$baseUrl/session/$sessionId/side-snapshot',
+    ).replace(queryParameters: query).toString();
+  }
+
+  String getQuestionImageUrl(int imageId) {
+    final query = token != null && token!.isNotEmpty
+        ? '?token=${Uri.encodeQueryComponent(token!)}'
+        : '';
+    return '$baseUrl/session/question-images/$imageId/file$query';
+  }
+
+  String getTeacherResultsExportUrl({
+    required String format,
+    int? subjectId,
+    String? branch,
+    String? division,
+    String? search,
+  }) {
+    final query = {
+      'format': format,
+      if (subjectId != null) 'subject_id': '$subjectId',
+      if (branch != null && branch.isNotEmpty) 'branch': branch,
+      if (division != null && division.isNotEmpty) 'division': division,
+      if (search != null && search.isNotEmpty) 'search': search,
+      if (token != null && token!.isNotEmpty) 'token': token!,
+    };
+    return Uri.parse('$baseUrl/teacher/results/export')
+        .replace(queryParameters: query)
+        .toString();
+  }
+
   String adminWebSocketUrl() => _ws('/ws/admin');
 
   String sessionWebSocketUrl(String sessionId) => _ws('/ws/session/$sessionId');
@@ -263,5 +673,11 @@ class ApiService {
     } catch (_) {
       return body.isEmpty ? 'Request failed' : body;
     }
+  }
+
+  MediaType _mediaType(String contentType) {
+    final parts = contentType.split('/');
+    if (parts.length != 2) return MediaType('application', 'octet-stream');
+    return MediaType(parts[0], parts[1]);
   }
 }

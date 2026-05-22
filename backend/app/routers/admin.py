@@ -1,17 +1,21 @@
+import asyncio
 import json
+import logging
 import time
-from datetime import datetime, timedelta, timezone
+import uuid
+from pathlib import Path
 
 import cv2
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from jose import JWTError
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..database import SessionLocal
-from ..models import Event, Session as SessionModel, User
-from ..schemas import DashboardStats, EventOut, SessionOut
+from ..models import Event, ExamQuestionImage, Session as SessionModel, User
+from ..role_filter import admin_session_payload, broadcast_monitoring_update
+from ..schemas import DashboardStats, EventOut, QuestionImageOut, SessionOut
 from ..security import decode_token_without_db, get_db, require_role
 from ..services.side_camera import get_latest_side_camera_frame
 from ..state import (
@@ -23,13 +27,15 @@ from ..state import (
 )
 
 router = APIRouter(tags=["admin"])
+logger = logging.getLogger(__name__)
+QUESTION_IMAGE_DIR = Path(__file__).resolve().parents[2] / "uploads" / "question_images"
+ALLOWED_QUESTION_IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg"}
 
 
 def _current_session_filter():
-    fresh_after = datetime.now(timezone.utc) - timedelta(minutes=3)
     return or_(
-        (SessionModel.is_active == True) & (SessionModel.updated_at >= fresh_after),
-        (SessionModel.approval_status == "PENDING") & (SessionModel.updated_at >= fresh_after),
+        SessionModel.is_active == True,
+        SessionModel.approval_status == "PENDING",
     )
 
 
@@ -47,11 +53,26 @@ def _serialize_event(event: Event) -> dict:
     ).model_dump(mode="json")
 
 
+def _question_image_path(stored_filename: str) -> Path:
+    return QUESTION_IMAGE_DIR / stored_filename
+
+
+def _serialize_question_image(image: ExamQuestionImage) -> dict:
+    return QuestionImageOut.model_validate(image).model_dump(mode="json")
+
+
+def _normalize_exam_title(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        raise HTTPException(status_code=422, detail="exam_title is required")
+    return normalized
+
+
 @router.get("/admin/sessions", response_model=list[SessionOut])
 def get_sessions(
     subject: str | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     query = db.query(SessionModel).filter(_current_session_filter())
     if subject and subject.upper() != "ALL":
@@ -63,7 +84,7 @@ def get_sessions(
 def get_session_detail(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
@@ -86,7 +107,7 @@ def get_session_detail(
 @router.get("/admin/stats", response_model=DashboardStats)
 def stats(
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     sessions = (
         db.query(SessionModel)
@@ -104,11 +125,95 @@ def stats(
     )
 
 
+@router.get("/admin/question-images", response_model=list[QuestionImageOut])
+def list_question_images(
+    subject: str | None = None,
+    exam_title: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("admin", "proctor")),
+):
+    query = db.query(ExamQuestionImage).filter(ExamQuestionImage.is_active == True)
+    if subject and subject.upper() != "ALL":
+        query = query.filter(ExamQuestionImage.subject == subject.upper())
+    if exam_title:
+        query = query.filter(ExamQuestionImage.exam_title == _normalize_exam_title(exam_title))
+    return query.order_by(
+        ExamQuestionImage.subject.asc(),
+        ExamQuestionImage.exam_title.asc(),
+        ExamQuestionImage.sort_order.asc(),
+        ExamQuestionImage.id.asc(),
+    ).all()
+
+
+@router.post("/admin/question-images", response_model=QuestionImageOut)
+async def upload_question_image(
+    subject: str = Form("GENERAL"),
+    exam_title: str = Form(...),
+    sort_order: int | None = Form(None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("admin", "proctor")),
+):
+    content_type = (file.content_type or "").lower()
+    if content_type not in ALLOWED_QUESTION_IMAGE_TYPES:
+        raise HTTPException(status_code=415, detail="Upload a PNG or JPG question image")
+
+    normalized_subject = subject.strip().upper() or "GENERAL"
+    normalized_exam_title = _normalize_exam_title(exam_title)
+    if sort_order is None:
+        current_max = (
+            db.query(ExamQuestionImage.sort_order)
+            .filter(
+                ExamQuestionImage.subject == normalized_subject,
+                ExamQuestionImage.exam_title == normalized_exam_title,
+                ExamQuestionImage.is_active == True,
+            )
+            .order_by(ExamQuestionImage.sort_order.desc())
+            .first()
+        )
+        sort_order = (current_max[0] + 1) if current_max else 1
+
+    extension = ALLOWED_QUESTION_IMAGE_TYPES[content_type]
+    stored_filename = f"{uuid.uuid4().hex}{extension}"
+    QUESTION_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=422, detail="Uploaded image is empty")
+    _question_image_path(stored_filename).write_bytes(contents)
+
+    image = ExamQuestionImage(
+        subject=normalized_subject,
+        exam_title=normalized_exam_title,
+        original_filename=file.filename or "question-image",
+        stored_filename=stored_filename,
+        content_type=content_type,
+        sort_order=sort_order,
+    )
+    db.add(image)
+    db.commit()
+    db.refresh(image)
+    return image
+
+
+@router.delete("/admin/question-images/{image_id}")
+def delete_question_image(
+    image_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_role("admin", "proctor")),
+):
+    image = db.query(ExamQuestionImage).filter(ExamQuestionImage.id == image_id).first()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Question image not found")
+    image.is_active = False
+    db.commit()
+    return {"status": "deleted", "id": image_id}
+
+
 @router.get("/admin/events", response_model=list[EventOut])
 def events(
     limit: int = 80,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     active_session_ids = [
         row.session_id
@@ -132,7 +237,7 @@ def events(
 async def terminate_session(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
@@ -150,7 +255,7 @@ async def terminate_session(
     db.add(event)
     db.commit()
     db.refresh(session)
-    await manager.broadcast(session_id, {"type": "terminated", **SessionOut.model_validate(session).model_dump(mode="json")})
+    await broadcast_monitoring_update(manager, session, "terminated")
     return session
 
 
@@ -158,7 +263,7 @@ async def terminate_session(
 async def flag_session(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
@@ -177,7 +282,7 @@ async def flag_session(
     ))
     db.commit()
     db.refresh(session)
-    await manager.broadcast(session_id, {"type": "manual_flag", **SessionOut.model_validate(session).model_dump(mode="json")})
+    await broadcast_monitoring_update(manager, session, "manual_flag")
     return session
 
 
@@ -258,7 +363,7 @@ def side_snapshot(
 async def approve_rejoin(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
@@ -280,7 +385,7 @@ async def approve_rejoin(
     ))
     db.commit()
     db.refresh(session)
-    await manager.broadcast(session_id, {"type": "rejoin_approved", **SessionOut.model_validate(session).model_dump(mode="json")})
+    await broadcast_monitoring_update(manager, session, "rejoin_approved")
     return session
 
 
@@ -288,7 +393,7 @@ async def approve_rejoin(
 async def deny_rejoin(
     session_id: str,
     db: Session = Depends(get_db),
-    user: User = Depends(require_role("admin")),
+    user: User = Depends(require_role("admin", "proctor")),
 ):
     session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
     if session is None:
@@ -310,7 +415,7 @@ async def deny_rejoin(
     ))
     db.commit()
     db.refresh(session)
-    await manager.broadcast(session_id, {"type": "rejoin_denied", **SessionOut.model_validate(session).model_dump(mode="json")})
+    await broadcast_monitoring_update(manager, session, "rejoin_denied")
     return session
 
 
@@ -320,18 +425,46 @@ async def ws_admin(websocket: WebSocket):
     if token:
         try:
             payload = decode_token_without_db(token)
-            if payload.get("role") != "admin":
+            if payload.get("role") not in {"admin", "proctor"}:
                 await websocket.close(code=1008)
                 return
         except JWTError:
             await websocket.close(code=1008)
             return
     await manager.connect_admin(websocket)
+    db = SessionLocal()
     try:
+        sessions = (
+            db.query(SessionModel)
+            .filter(_current_session_filter())
+            .order_by(SessionModel.updated_at.desc())
+            .all()
+        )
+        await websocket.send_json({
+            "type": "dashboard_snapshot",
+            "sessions": [
+                admin_session_payload(session, "dashboard_snapshot")
+                for session in sessions
+            ],
+        })
         while True:
-            await websocket.receive_text()
+            try:
+                text = await asyncio.wait_for(websocket.receive_text(), timeout=35)
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    message = {"type": text}
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
         manager.disconnect_admin(websocket)
+    except Exception:
+        logger.exception("Admin websocket failed")
+        manager.disconnect_admin(websocket)
+    finally:
+        db.close()
 
 
 @router.websocket("/ws/session/{session_id}")
@@ -346,6 +479,18 @@ async def ws_session(session_id: str, websocket: WebSocket):
     await manager.connect_session(session_id, websocket)
     try:
         while True:
-            await websocket.receive_text()
+            try:
+                text = await asyncio.wait_for(websocket.receive_text(), timeout=35)
+                try:
+                    message = json.loads(text)
+                except json.JSONDecodeError:
+                    message = {"type": text}
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
+        manager.disconnect_session(session_id, websocket)
+    except Exception:
+        logger.exception("Session websocket failed; session_id=%s", session_id)
         manager.disconnect_session(session_id, websocket)

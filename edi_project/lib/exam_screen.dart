@@ -2,17 +2,23 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'app_state.dart';
+import 'exam_copy_guard.dart';
+
+void _noop() {}
 
 class ExamScreen extends StatefulWidget {
   const ExamScreen({
     super.key,
     required this.examTitle,
+    this.examId,
+    this.durationMinutes = 60,
     required this.subject,
     required this.sideCameraUrl,
     required this.studentId,
@@ -20,6 +26,8 @@ class ExamScreen extends StatefulWidget {
   });
 
   final String examTitle;
+  final int? examId;
+  final int durationMinutes;
   final String subject;
   final String sideCameraUrl;
   final String studentId;
@@ -30,38 +38,40 @@ class ExamScreen extends StatefulWidget {
 }
 
 class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
-  final List<_Question> _questions = const [
-    _Question('Which algorithm is supervised learning?', [
+  static const List<_Question> _fallbackQuestions = [
+    _Question.text('Which algorithm is supervised learning?', [
       'K-Means',
       'Linear Regression',
       'PCA',
       'Association Rules',
     ]),
-    _Question('Which layer secures HTTPS traffic?', [
+    _Question.text('Which layer secures HTTPS traffic?', [
       'Transport',
       'Presentation',
       'Network',
       'Physical',
     ]),
-    _Question('What does a confusion matrix summarize?', [
+    _Question.text('What does a confusion matrix summarize?', [
       'Disk usage',
       'Model predictions',
       'Network packets',
       'CPU scheduling',
     ]),
-    _Question('Which metric is useful for imbalanced classes?', [
+    _Question.text('Which metric is useful for imbalanced classes?', [
       'Accuracy only',
       'F1 score',
       'Clock speed',
       'Bandwidth',
     ]),
-    _Question('What is phishing?', [
+    _Question.text('What is phishing?', [
       'A social engineering attack',
       'A compiler phase',
       'A sorting method',
       'A database index',
     ]),
   ];
+
+  List<_Question> _questions = _fallbackQuestions;
 
   CameraController? _cameraController;
   Future<void>? _cameraInitialization;
@@ -70,22 +80,27 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
   Timer? _sideCheckTimer;
   Timer? _clockTimer;
   Timer? _reconnectTimer;
+  Timer? _heartbeatTimer;
 
   late final String _sessionId;
+  late String _sideCameraUrl;
   final Map<String, String> _answers = {};
 
   int _currentIndex = 0;
-  int _remainingSeconds = 60 * 60;
-  double _cheatScore = 0;
+  late int _remainingSeconds;
   bool _cameraReady = false;
   bool _monitoringStarted = false;
   bool _uploading = false;
   bool _checkingSideCamera = false;
   bool _connected = false;
+  bool _loadingQuestions = true;
   bool _submitting = false;
+  bool _submitted = false;
+  bool _closingDialogVisible = false;
+  bool _sideReconnectBusy = false;
+  bool _disposed = false;
   DateTime? _lastDisconnectLogAt;
   String? _cameraError;
-  String _aiMessage = 'AI monitoring active';
   String _candidateStatus = 'MONITORING';
   String _sideCameraStatus = 'UNKNOWN';
 
@@ -94,9 +109,47 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _sessionId = '${widget.studentId}-${DateTime.now().millisecondsSinceEpoch}';
+    _remainingSeconds = widget.durationMinutes * 60;
+    _sideCameraUrl = widget.sideCameraUrl;
+    enableExamCopyGuard();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    unawaited(_loadQuestionImages());
     unawaited(_ensureCameraInitialized());
     _startExam();
+  }
+
+  Future<void> _loadQuestionImages() async {
+    try {
+      final api = context.read<AppState>().api;
+      final rows = await api.getQuestionImages(
+        examId: widget.examId,
+        subject: widget.subject,
+        examTitle: widget.examTitle,
+      );
+      if (!mounted) return;
+      final imageQuestions = rows.map((item) {
+        final map = Map<String, dynamic>.from(item as Map);
+        final id = (map['id'] as num).toInt();
+        return _Question.image(
+          id: id,
+          imageUrl: api.getQuestionImageUrl(id),
+          filename: map['original_filename']?.toString() ?? 'Question image',
+        );
+      }).toList();
+      setState(() {
+        _questions = imageQuestions.isEmpty ? _fallbackQuestions : imageQuestions;
+        _currentIndex = 0;
+        _loadingQuestions = false;
+      });
+    } catch (error, stackTrace) {
+      debugPrint('Question image load failed: $error\n$stackTrace');
+      if (mounted) {
+        setState(() {
+          _questions = _fallbackQuestions;
+          _loadingQuestions = false;
+        });
+      }
+    }
   }
 
   Future<void> _startExam() async {
@@ -104,6 +157,7 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     try {
       final session = await app.api.startSession(
         sessionId: _sessionId,
+        examId: widget.examId,
         studentId: widget.studentId,
         studentName: widget.studentName,
         examTitle: widget.examTitle,
@@ -115,7 +169,6 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       if (session['status'] == 'REJOIN_PENDING') {
         setState(() {
           _connected = true;
-          _aiMessage = 'Waiting for proctor approval to rejoin this exam.';
         });
         return;
       }
@@ -124,7 +177,6 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           _connected = false;
-          _aiMessage = 'Backend connection failed: $error';
         });
       }
     }
@@ -187,7 +239,6 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     setState(() {
       _cameraError = message;
       _cameraReady = false;
-      _aiMessage = message;
     });
   }
 
@@ -198,20 +249,41 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
         Uri.parse(context.read<AppState>().api.sessionWebSocketUrl(_sessionId)),
       );
       setState(() => _connected = true);
+      _heartbeatTimer?.cancel();
+      _heartbeatTimer = Timer.periodic(const Duration(seconds: 20), (_) {
+        try {
+          _channel?.sink.add(jsonEncode({'type': 'ping'}));
+        } catch (error, stackTrace) {
+          debugPrint('Exam websocket ping failed: $error\n$stackTrace');
+          _scheduleReconnect();
+        }
+      });
       _channel!.stream.listen(
-        (data) =>
-            _handleRealtime(jsonDecode(data as String) as Map<String, dynamic>),
-        onError: (_) => _scheduleReconnect(),
+        (data) {
+          try {
+            final decoded = jsonDecode(data as String) as Map<String, dynamic>;
+            if (decoded['type'] == 'pong') return;
+            _handleRealtime(decoded);
+          } catch (error, stackTrace) {
+            debugPrint('Exam realtime decode failed: $error\n$stackTrace');
+          }
+        },
+        onError: (error, stackTrace) {
+          debugPrint('Exam websocket error: $error\n$stackTrace');
+          _scheduleReconnect();
+        },
         onDone: _scheduleReconnect,
       );
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('Exam websocket connect failed: $error\n$stackTrace');
       _scheduleReconnect();
     }
   }
 
   void _scheduleReconnect() {
-    if (!mounted) return;
+    if (!mounted || _submitted || _disposed) return;
     setState(() => _connected = false);
+    _heartbeatTimer?.cancel();
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(const Duration(seconds: 3), _connectWebSocket);
   }
@@ -219,26 +291,27 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
   void _handleRealtime(Map<String, dynamic> data) {
     if (!mounted) return;
     setState(() {
-      _cheatScore = ((data['cheat_score'] ?? _cheatScore) as num).toDouble();
-      _sideCameraStatus =
-          (data['side_camera_status'] ?? _sideCameraStatus).toString();
+      _sideCameraStatus = (data['side_camera_status'] ?? _sideCameraStatus)
+          .toString();
       _candidateStatus =
           (data['candidate_status'] ?? data['status'] ?? _candidateStatus)
               .toString();
-      _aiMessage = (data['message'] ?? data['cheat_message'] ?? _aiMessage)
-          .toString();
     });
     if (_candidateStatus == 'MONITORING' && !_monitoringStarted) {
       _activateMonitoring();
     }
-    if (_candidateStatus == 'AUTO_SUBMIT_REQUIRED' || _cheatScore >= 95) {
-      _submitExam(reason: 'auto_submitted_cheating_threshold');
+    if (_candidateStatus == 'AUTO_SUBMIT_REQUIRED' && !_submitted) {
+      unawaited(_submitExam(reason: 'auto_submitted_cheating_threshold'));
     }
     if (_candidateStatus == 'TERMINATED') {
-      _showClosedDialog('This exam session was terminated by the proctor.');
+      unawaited(_showClosedDialog('This exam session is closed.'));
     }
     if (_candidateStatus == 'REJOIN_DENIED') {
-      _showClosedDialog('Your request to rejoin this exam was denied.');
+      unawaited(_showClosedDialog('This exam session is closed.'));
+    }
+    if (_candidateStatus == 'SUBMITTED' && !_submitted) {
+      _submitted = true;
+      unawaited(_showClosedDialog('Exam submitted successfully.'));
     }
   }
 
@@ -246,7 +319,7 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       if (_remainingSeconds <= 1) {
-        _submitExam(reason: 'time_expired');
+        unawaited(_submitExam(reason: 'time_expired'));
       } else {
         setState(() => _remainingSeconds--);
       }
@@ -265,6 +338,7 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
   Future<void> _uploadFrontFrame() async {
     final controller = _cameraController;
     if (_uploading ||
+        _sideCameraNeedsReconnect ||
         controller == null ||
         !controller.value.isInitialized ||
         controller.value.isTakingPicture) {
@@ -283,15 +357,16 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       );
       _handleRealtime(result);
       if (mounted) setState(() => _connected = true);
-    } catch (_) {
+    } catch (error, stackTrace) {
+      debugPrint('Front frame upload failed: $error\n$stackTrace');
       if (mounted) {
         setState(() {
           _connected = false;
-          _aiMessage = 'Network interrupted. Reconnecting monitoring channel.';
         });
       }
       final now = DateTime.now();
-      final shouldLogDisconnect = _lastDisconnectLogAt == null ||
+      final shouldLogDisconnect =
+          _lastDisconnectLogAt == null ||
           now.difference(_lastDisconnectLogAt!) > const Duration(seconds: 20);
       if (shouldLogDisconnect) {
         _lastDisconnectLogAt = now;
@@ -313,11 +388,11 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       if (!_monitoringStarted || _submitting || _checkingSideCamera) return;
       _checkingSideCamera = true;
       try {
-        final result = await context.read<AppState>().api.checkSideCamera(
-          _sessionId,
-        );
+        final api = context.read<AppState>().api;
+        final result = await api.checkSideCamera(_sessionId);
         _handleRealtime(result);
-      } catch (_) {
+      } catch (error, stackTrace) {
+        debugPrint('Side camera check failed: $error\n$stackTrace');
       } finally {
         _checkingSideCamera = false;
       }
@@ -338,7 +413,9 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
         severity: severity,
         scoreDelta: scoreDelta,
       );
-    } catch (_) {}
+    } catch (error, stackTrace) {
+      debugPrint('Client event log failed: $error\n$stackTrace');
+    }
   }
 
   @override
@@ -356,36 +433,99 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _submitExam({String reason = 'submitted_by_candidate'}) async {
-    if (_submitting) return;
-    if (!_monitoringStarted) return;
+    if (_submitting || _submitted) return;
+    if (reason == 'submitted_by_candidate') {
+      final confirmed = await _confirmSubmit();
+      if (confirmed != true || !mounted) return;
+    }
+    _captureTimer?.cancel();
+    _sideCheckTimer?.cancel();
+    _clockTimer?.cancel();
+    _captureTimer = null;
+    _sideCheckTimer = null;
+    _clockTimer = null;
     setState(() => _submitting = true);
+    final api = context.read<AppState>().api;
     try {
-      await context.read<AppState>().api.submitExam(
+      final result = await api.submitExam(
         sessionId: _sessionId,
         answers: _answers,
         reason: reason,
       );
+      _handleRealtime(result);
       if (!mounted) return;
+      setState(() => _submitted = true);
       await _showClosedDialog(
         reason == 'submitted_by_candidate'
             ? 'Exam submitted successfully.'
             : 'Exam auto-submitted.',
       );
-    } catch (error) {
+    } on TimeoutException catch (error, stackTrace) {
+      debugPrint('Submit exam timed out: $error\n$stackTrace');
       if (mounted) {
+        _restartSubmitTimersIfNeeded();
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Submission timed out. Check connection and retry.'),
+          ),
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Submit exam failed: $error\n$stackTrace');
+      if (mounted) {
+        _restartSubmitTimersIfNeeded();
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Submit failed: $error')));
       }
     } finally {
-      if (mounted) setState(() => _submitting = false);
+      if (mounted && !_submitted) setState(() => _submitting = false);
     }
   }
 
+  Future<bool?> _confirmSubmit() {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Submit Exam?'),
+        content: const Text(
+          'Your answers will be submitted and the exam will close.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Submit'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _restartSubmitTimersIfNeeded() {
+    if (_submitted || !_monitoringStarted) return;
+    _startSideCameraWatchdog();
+    if (_clockTimer == null || !_clockTimer!.isActive) _startClock();
+    if (_cameraReady) _startFrameUpload();
+  }
+
   Future<void> _showClosedDialog(String message) async {
+    if (!mounted || _closingDialogVisible) return;
+    _closingDialogVisible = true;
     _captureTimer?.cancel();
     _sideCheckTimer?.cancel();
     _clockTimer?.cancel();
+    _captureTimer = null;
+    _sideCheckTimer = null;
+    _clockTimer = null;
+    _heartbeatTimer?.cancel();
+    _reconnectTimer?.cancel();
+    await _channel?.sink.close();
+    if (!mounted) return;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -396,34 +536,44 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
           FilledButton(
             onPressed: () {
               Navigator.pop(context);
-              Navigator.pop(context);
+              Navigator.of(context).pushNamedAndRemoveUntil(
+                '/student_home',
+                (route) => route.settings.name == '/login',
+              );
             },
             child: const Text('Return'),
           ),
         ],
       ),
     );
+    _closingDialogVisible = false;
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _disposed = true;
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     _captureTimer?.cancel();
     _sideCheckTimer?.cancel();
     _clockTimer?.cancel();
     _reconnectTimer?.cancel();
+    _heartbeatTimer?.cancel();
     _channel?.sink.close();
     _cameraController?.dispose();
+    disableExamCopyGuard();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final question = _questions[_currentIndex];
-    return PopScope(
-      canPop: false,
-      child: Scaffold(
+    return Focus(
+      autofocus: true,
+      onKeyEvent: _handleExamKey,
+      child: PopScope(
+        canPop: false,
+        child: Scaffold(
         appBar: AppBar(
           automaticallyImplyLeading: false,
           title: Text(widget.examTitle),
@@ -445,27 +595,70 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
         body: LayoutBuilder(
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 980;
-            final content = [
-              Expanded(flex: 3, child: _buildQuestionPanel(question)),
-              const SizedBox(width: 16, height: 16),
-              SizedBox(
-                width: wide ? 340 : double.infinity,
-                child: _buildMonitorPanel(),
-              ),
-            ];
-            return Padding(
+            final content = Padding(
               padding: const EdgeInsets.all(18),
               child: wide
                   ? Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: content,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Expanded(flex: 3, child: _buildQuestionPanel(question)),
+                        const SizedBox(width: 16),
+                        SizedBox(
+                          width: 340,
+                          child: SingleChildScrollView(
+                            child: _buildMonitorPanel(),
+                          ),
+                        ),
+                      ],
                     )
-                  : Column(children: content),
+                  : ListView(
+                      children: [
+                        SizedBox(
+                          height: (constraints.maxHeight * 0.58).clamp(
+                            420.0,
+                            620.0,
+                          ),
+                          child: _buildQuestionPanel(question),
+                        ),
+                        const SizedBox(height: 16),
+                        _buildMonitorPanel(),
+                      ],
+                    ),
+            );
+            return Stack(
+              children: [
+                content,
+                if (_sideCameraNeedsReconnect) _buildSideCameraOverlay(),
+              ],
             );
           },
         ),
+        ),
       ),
     );
+  }
+
+  KeyEventResult _handleExamKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    final pressed = HardwareKeyboard.instance.logicalKeysPressed;
+    final command = pressed.contains(LogicalKeyboardKey.controlLeft) ||
+        pressed.contains(LogicalKeyboardKey.controlRight) ||
+        pressed.contains(LogicalKeyboardKey.metaLeft) ||
+        pressed.contains(LogicalKeyboardKey.metaRight);
+    final blocked = {
+      LogicalKeyboardKey.keyA,
+      LogicalKeyboardKey.keyC,
+      LogicalKeyboardKey.keyP,
+      LogicalKeyboardKey.keyS,
+      LogicalKeyboardKey.keyU,
+      LogicalKeyboardKey.keyV,
+      LogicalKeyboardKey.keyX,
+    };
+    if (key == LogicalKeyboardKey.f12 || (command && blocked.contains(key))) {
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
   }
 
   Widget _buildQuestionPanel(_Question question) {
@@ -492,36 +685,12 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
               value: (_currentIndex + 1) / _questions.length,
             ),
             const SizedBox(height: 24),
-            Text(
-              question.title,
-              style: Theme.of(
-                context,
-              ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 18),
             Expanded(
-              child: RadioGroup<String>(
-                groupValue: _answers[_currentIndex.toString()],
-                onChanged: (value) => setState(
-                  () => _answers[_currentIndex.toString()] = value ?? '',
-                ),
-                child: ListView.separated(
-                  itemCount: question.options.length,
-                  separatorBuilder: (context, index) =>
-                      const SizedBox(height: 10),
-                  itemBuilder: (context, index) {
-                    final option = question.options[index];
-                    return RadioListTile<String>(
-                      value: option,
-                      title: Text(option),
-                      tileColor: const Color(0xFF0F172A),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    );
-                  },
-                ),
-              ),
+              child: _loadingQuestions
+                  ? const Center(child: CircularProgressIndicator())
+                  : question.isImage
+                  ? _buildImageQuestion(question)
+                  : _buildTextQuestion(question),
             ),
             const SizedBox(height: 14),
             Wrap(
@@ -542,32 +711,41 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
             const SizedBox(height: 16),
             Row(
               children: [
-                OutlinedButton.icon(
-                  onPressed: _currentIndex == 0
-                      ? null
-                      : () => setState(() => _currentIndex--),
-                  icon: const Icon(Icons.chevron_left),
-                  label: const Text('Previous'),
+                Flexible(
+                  child: OutlinedButton.icon(
+                    onPressed: _currentIndex == 0
+                        ? null
+                        : () => setState(() => _currentIndex--),
+                    icon: const Icon(Icons.chevron_left),
+                    label: const Text('Previous'),
+                  ),
                 ),
-                const SizedBox(width: 10),
-                OutlinedButton.icon(
-                  onPressed: _currentIndex == _questions.length - 1
-                      ? null
-                      : () => setState(() => _currentIndex++),
-                  icon: const Icon(Icons.chevron_right),
-                  label: const Text('Next'),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: OutlinedButton.icon(
+                    onPressed: _currentIndex == _questions.length - 1
+                        ? null
+                        : () => setState(() => _currentIndex++),
+                    icon: const Icon(Icons.chevron_right),
+                    label: const Text('Next'),
+                  ),
                 ),
-                const Spacer(),
-                FilledButton.icon(
-                  onPressed: _submitting ? null : () => _submitExam(),
-                  icon: _submitting
-                      ? const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.task_alt),
-                  label: const Text('Submit Exam'),
+                const SizedBox(width: 8),
+                Flexible(
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: FilledButton.icon(
+                      onPressed: _submitting ? null : () => _submitExam(),
+                      icon: _submitting
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.task_alt),
+                      label: const Text('Submit Exam'),
+                    ),
+                  ),
                 ),
               ],
             ),
@@ -577,81 +755,128 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildImageQuestion(_Question question) {
+    final answerKey = _currentIndex.toString();
+    return Column(
+      children: [
+        Expanded(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: ColoredBox(
+              color: Colors.black,
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  InteractiveViewer(
+                    minScale: 0.8,
+                    maxScale: 3.0,
+                    child: Center(
+                      child: Image.network(
+                        question.imageUrl!,
+                        fit: BoxFit.contain,
+                        gaplessPlayback: true,
+                        filterQuality: FilterQuality.high,
+                        errorBuilder: (context, error, stackTrace) =>
+                            const _FeedPlaceholder(
+                              text: 'Question image unavailable',
+                              loading: false,
+                              onRetry: _noop,
+                            ),
+                      ),
+                    ),
+                  ),
+                  IgnorePointer(
+                    child: _WatermarkOverlay(
+                      studentName: widget.studentName,
+                      studentId: widget.studentId,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        TextFormField(
+          key: ValueKey('answer-$answerKey'),
+          initialValue: _answers[answerKey] ?? '',
+          minLines: 2,
+          maxLines: 4,
+          onChanged: (value) => _answers[answerKey] = value,
+          decoration: const InputDecoration(
+            labelText: 'Answer',
+            prefixIcon: Icon(Icons.edit_note),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildTextQuestion(_Question question) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          question.title,
+          style: Theme.of(
+            context,
+          ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w800),
+        ),
+        const SizedBox(height: 18),
+        Expanded(
+          child: RadioGroup<String>(
+            groupValue: _answers[_currentIndex.toString()],
+            onChanged: (value) => setState(
+              () => _answers[_currentIndex.toString()] = value ?? '',
+            ),
+            child: ListView.separated(
+              itemCount: question.options.length,
+              separatorBuilder: (context, index) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                final option = question.options[index];
+                return RadioListTile<String>(
+                  value: option,
+                  title: Text(option),
+                  tileColor: const Color(0xFF0F172A),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildMonitorPanel() {
     return Column(
       children: [
-        AspectRatio(
-          aspectRatio: 4 / 3,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.cyanAccent, width: 2),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: _buildFrontCameraPreview(),
+        _CameraPreviewTile(
+          title: 'Front camera',
+          accent: Colors.cyanAccent,
+          child: _buildFrontCameraPreview(),
+        ),
+        const SizedBox(height: 12),
+        _CameraPreviewTile(
+          title: 'Side camera',
+          accent: _sideCameraStatus == 'ONLINE'
+              ? Colors.greenAccent
+              : Colors.cyanAccent,
+          child: _SnapshotFeed(
+            sessionId: _sessionId,
+            side: true,
+            emptyText: 'Side camera connecting',
           ),
         ),
         const SizedBox(height: 12),
-        AspectRatio(
-          aspectRatio: 4 / 3,
-          child: Container(
-            decoration: BoxDecoration(
-              color: Colors.black,
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.white24),
-            ),
-            clipBehavior: Clip.antiAlias,
-            child: _SnapshotFeed(
-              sessionId: _sessionId,
-              side: true,
-              emptyText: 'Waiting for side camera feed',
-            ),
-          ),
-        ),
-        const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    const Icon(Icons.radar, color: Colors.cyanAccent),
-                    const SizedBox(width: 8),
-                    const Expanded(
-                      child: Text(
-                        'AI Monitoring Active',
-                        style: TextStyle(fontWeight: FontWeight.w800),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 14),
-                _Metric(
-                  label: 'Candidate status',
-                  value: _studentCandidateStatus,
-                  color: Colors.cyanAccent,
-                ),
-                _Metric(
-                  label: 'Side camera',
-                  value: _sideCameraStatus,
-                  color: _sideCameraStatus == 'ONLINE'
-                      ? Colors.greenAccent
-                      : Colors.orangeAccent,
-                ),
-                const Divider(height: 22),
-                Text(
-                  _studentMonitoringMessage,
-                  style: const TextStyle(
-                    color: Colors.white70,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-              ],
-            ),
-          ),
+        _SecureMonitoringPanel(
+          connected: _connected,
+          monitoringStarted: _monitoringStarted,
+          sideCameraStatus: _sideCameraStatus,
+          candidateStatus: _studentCandidateStatus,
+          timeText: _timeText,
         ),
       ],
     );
@@ -663,15 +888,6 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
     return '$minutes:$seconds';
   }
 
-  String get _studentMonitoringMessage {
-    if (_cameraError != null) return _cameraError!;
-    if (!_connected) return _aiMessage;
-    if (!_monitoringStarted) return _aiMessage;
-    return _sideCameraStatus == 'ONLINE'
-        ? 'Monitoring connection active.'
-        : 'Waiting for side camera connection.';
-  }
-
   String get _studentCandidateStatus {
     return switch (_candidateStatus) {
       'REJOIN_PENDING' => 'WAITING FOR APPROVAL',
@@ -680,6 +896,17 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       'TERMINATED' => 'CLOSED',
       _ => 'MONITORING',
     };
+  }
+
+  bool get _sideCameraNeedsReconnect {
+    return {
+      'INVALID_IP',
+      'STREAM_FAILED',
+      'CAMERA_OFFLINE',
+      'OFFLINE',
+      'RECONNECTING',
+      'RETRYING',
+    }.contains(_sideCameraStatus);
   }
 
   Widget _buildFrontCameraPreview() {
@@ -699,6 +926,157 @@ class _ExamScreenState extends State<ExamScreen> with WidgetsBindingObserver {
       );
     }
     return const Center(child: CircularProgressIndicator());
+  }
+
+  Widget _buildSideCameraOverlay() {
+    return Positioned(
+      left: 18,
+      right: 18,
+      bottom: 18,
+      child: Material(
+        elevation: 8,
+        borderRadius: BorderRadius.circular(8),
+        color: const Color(0xFF111827),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 12,
+            runSpacing: 10,
+            children: [
+              Icon(
+                Icons.videocam_off,
+                color: _sideCameraStatus == 'RECONNECTING'
+                    ? Colors.orangeAccent
+                    : Colors.redAccent,
+              ),
+              const Text(
+                'Side camera connection required',
+                style: TextStyle(fontWeight: FontWeight.w900),
+              ),
+              Text(
+                _sideCameraStatus,
+                style: const TextStyle(color: Colors.white60),
+              ),
+              OutlinedButton.icon(
+                onPressed: _sideReconnectBusy ? null : _retrySideCamera,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+              FilledButton.icon(
+                onPressed: _sideReconnectBusy ? null : _changeSideCameraIp,
+                icon: _sideReconnectBusy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.edit),
+                label: const Text('Re-enter IP'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _retrySideCamera() async {
+    setState(() => _sideReconnectBusy = true);
+    try {
+      final result = await context.read<AppState>().api.checkSideCamera(
+        _sessionId,
+      );
+      _handleRealtime(result);
+      if (mounted && !_sideCameraNeedsReconnect && _cameraReady) {
+        _startFrameUpload();
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Side camera retry failed: $error\n$stackTrace');
+      if (mounted) setState(() => _sideCameraStatus = 'STREAM_FAILED');
+    } finally {
+      if (mounted) setState(() => _sideReconnectBusy = false);
+    }
+  }
+
+  Future<void> _changeSideCameraIp() async {
+    final controller = TextEditingController(text: _sideCameraUrl);
+    final sideIp = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Reconnect Side Camera'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: 'Camera URL or IP',
+            hintText: '192.168.0.5 or rtsp://admin:pass@192.168.0.5:8554',
+            helperText:
+                'Examples: 192.168.0.5, http://192.168.0.5:8080/video, rtsp://admin:pass@192.168.0.5:8554',
+            prefixIcon: Icon(Icons.settings_input_antenna),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            icon: const Icon(Icons.refresh),
+            label: const Text('Reconnect'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (sideIp == null || sideIp.isEmpty || !mounted) return;
+    setState(() {
+      _sideReconnectBusy = true;
+      _sideCameraStatus = 'RETRYING';
+    });
+    final app = context.read<AppState>();
+    try {
+      final result = await app.api.reconnectSideCamera(
+        sessionId: _sessionId,
+        sideCameraUrl: sideIp,
+      );
+      final success = result['success'] == true;
+      setState(() {
+        _sideCameraStatus =
+            (result['state'] ?? (success ? 'ONLINE' : 'STREAM_FAILED'))
+                .toString();
+      });
+      if (success) {
+        final resolvedUrl = result['resolved_url']?.toString() ?? '';
+        final usableUrl = resolvedUrl.isNotEmpty
+            ? resolvedUrl
+            : result['side_camera_url']?.toString() ?? sideIp;
+        await app.rememberSideCameraUrl(usableUrl);
+        _sideCameraUrl = usableUrl;
+        if (mounted && _cameraReady) _startFrameUpload();
+      } else if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              result['message']?.toString() ??
+                  'Unable to connect to side camera',
+            ),
+          ),
+        );
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Side camera reconnect failed: $error\n$stackTrace');
+      if (mounted) {
+        setState(() => _sideCameraStatus = 'STREAM_FAILED');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Unable to connect to side camera: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _sideReconnectBusy = false);
+    }
   }
 }
 
@@ -720,12 +1098,22 @@ class _SnapshotFeed extends StatefulWidget {
 class _SnapshotFeedState extends State<_SnapshotFeed> {
   Timer? _timer;
   int _cacheKey = 0;
+  int _frameRefreshCount = 0;
+  int _reconnectAttempts = 0;
+  bool _hadFrame = false;
+  bool _failed = false;
+  DateTime? _lastFrameAt;
 
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(milliseconds: 400), (_) {
-      if (mounted) setState(() => _cacheKey++);
+    _timer = Timer.periodic(const Duration(milliseconds: 450), (_) {
+      final lastFrameAt = _lastFrameAt;
+      if (lastFrameAt != null &&
+          DateTime.now().difference(lastFrameAt) > const Duration(seconds: 4)) {
+        _recordReconnect('freeze detected');
+      }
+      _refreshNow();
     });
   }
 
@@ -739,29 +1127,337 @@ class _SnapshotFeedState extends State<_SnapshotFeed> {
   Widget build(BuildContext context) {
     final api = context.read<AppState>().api;
     final url = widget.side
-        ? api.getSideSnapshotUrl(widget.sessionId, _cacheKey)
+        ? api.getStudentSideSnapshotUrl(widget.sessionId, _cacheKey)
         : api.getSnapshotUrl(widget.sessionId, _cacheKey);
     return Image.network(
       url,
       fit: BoxFit.contain,
       gaplessPlayback: true,
-      webHtmlElementStrategy: WebHtmlElementStrategy.prefer,
-      errorBuilder: (context, error, stackTrace) => Center(
-        child: Text(
-          widget.emptyText,
-          style: const TextStyle(color: Colors.white54),
-          textAlign: TextAlign.center,
+      webHtmlElementStrategy: kIsWeb
+          ? WebHtmlElementStrategy.prefer
+          : WebHtmlElementStrategy.never,
+      frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+        if (frame != null || wasSynchronouslyLoaded) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && (!_hadFrame || _failed)) {
+              setState(() {
+                _hadFrame = true;
+                _failed = false;
+              });
+            }
+            _lastFrameAt = DateTime.now();
+            _frameRefreshCount++;
+            if (_frameRefreshCount == 1 || _frameRefreshCount % 25 == 0) {
+              debugPrint(
+                'Side camera frame refresh count=$_frameRefreshCount '
+                'session=${widget.sessionId}',
+              );
+            }
+          });
+        }
+        return child;
+      },
+      loadingBuilder: (context, child, progress) {
+        if (progress == null) return child;
+        if (_hadFrame && !_failed) return child;
+        return _FeedPlaceholder(
+          text: _hadFrame ? 'Refreshing side camera' : widget.emptyText,
+          loading: true,
+          onRetry: _refreshNow,
+        );
+      },
+      errorBuilder: (context, error, stackTrace) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && !_failed) {
+            _recordReconnect('snapshot failed');
+            setState(() => _failed = true);
+          }
+        });
+        return _FeedPlaceholder(
+          text: _hadFrame
+              ? 'Side camera reconnecting'
+              : 'Side camera unavailable',
+          loading: !_hadFrame,
+          onRetry: _refreshNow,
+        );
+      },
+    );
+  }
+
+  void _refreshNow() {
+    if (mounted) setState(() => _cacheKey++);
+  }
+
+  void _recordReconnect(String reason) {
+    _reconnectAttempts++;
+    _lastFrameAt = DateTime.now();
+    debugPrint(
+      'Side camera reconnect attempt=$_reconnectAttempts '
+      'reason=$reason session=${widget.sessionId}',
+    );
+  }
+}
+
+class _FeedPlaceholder extends StatelessWidget {
+  const _FeedPlaceholder({
+    required this.text,
+    required this.loading,
+    required this.onRetry,
+  });
+
+  final String text;
+  final bool loading;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: Colors.black,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(18),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (loading)
+                const SizedBox(
+                  width: 26,
+                  height: 26,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                const Icon(Icons.videocam_off, color: Colors.white38),
+              const SizedBox(height: 12),
+              Text(
+                text,
+                style: const TextStyle(color: Colors.white60),
+                textAlign: TextAlign.center,
+              ),
+              if (!loading) ...[
+                const SizedBox(height: 10),
+                OutlinedButton.icon(
+                  onPressed: onRetry,
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Reconnect'),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     );
   }
 }
 
+class _CameraPreviewTile extends StatelessWidget {
+  const _CameraPreviewTile({
+    required this.title,
+    required this.accent,
+    required this.child,
+  });
+
+  final String title;
+  final Color accent;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF070B16),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: accent.withValues(alpha: 0.45), width: 1.5),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        children: [
+          Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 10),
+            color: const Color(0xFF0B1224),
+            child: Row(
+              children: [
+                Icon(Icons.videocam, color: accent, size: 16),
+                const SizedBox(width: 8),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          AspectRatio(
+            aspectRatio: 4 / 3,
+            child: ColoredBox(color: Colors.black, child: child),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SecureMonitoringPanel extends StatelessWidget {
+  const _SecureMonitoringPanel({
+    required this.connected,
+    required this.monitoringStarted,
+    required this.sideCameraStatus,
+    required this.candidateStatus,
+    required this.timeText,
+  });
+
+  final bool connected;
+  final bool monitoringStarted;
+  final String sideCameraStatus;
+  final String candidateStatus;
+  final String timeText;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF08111F),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.cyanAccent.withValues(alpha: 0.28)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.radar, color: Colors.cyanAccent),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'AI Monitoring Active',
+                  style: TextStyle(fontWeight: FontWeight.w900),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          _StatusRow(
+            label: 'Connection',
+            value: connected ? 'Connected' : 'Reconnecting',
+            color: connected ? Colors.greenAccent : Colors.orangeAccent,
+          ),
+          _StatusRow(
+            label: 'Monitoring',
+            value: monitoringStarted ? candidateStatus : 'STARTING',
+            color: Colors.cyanAccent,
+          ),
+          _StatusRow(
+            label: 'Side camera',
+            value: sideCameraStatus,
+            color: sideCameraStatus == 'ONLINE'
+                ? Colors.greenAccent
+                : Colors.orangeAccent,
+          ),
+          _StatusRow(label: 'Timer', value: timeText, color: Colors.redAccent),
+        ],
+      ),
+    );
+  }
+}
+
+class _StatusRow extends StatelessWidget {
+  const _StatusRow({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
+
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(label, style: const TextStyle(color: Colors.white60)),
+          ),
+          Text(
+            value,
+            style: TextStyle(color: color, fontWeight: FontWeight.w900),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WatermarkOverlay extends StatelessWidget {
+  const _WatermarkOverlay({
+    required this.studentName,
+    required this.studentId,
+  });
+
+  final String studentName;
+  final String studentId;
+
+  @override
+  Widget build(BuildContext context) {
+    final timestamp = DateTime.now().toIso8601String().substring(0, 16);
+    final text = '$studentName | $studentId | $timestamp';
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = (constraints.maxWidth / 220).ceil().clamp(2, 6);
+        final rows = (constraints.maxHeight / 120).ceil().clamp(2, 8);
+        return GridView.builder(
+          physics: const NeverScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(24),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            childAspectRatio: 2.6,
+          ),
+          itemCount: columns * rows,
+          itemBuilder: (context, index) => Transform.rotate(
+            angle: -0.45,
+            child: Center(
+              child: Text(
+                text,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Colors.white24,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 class _Question {
-  const _Question(this.title, this.options);
+  const _Question.text(this.title, this.options)
+    : imageId = null,
+      imageUrl = null,
+      filename = null;
+
+  const _Question.image({
+    required this.imageId,
+    required this.imageUrl,
+    required this.filename,
+  }) : title = '',
+       options = const [];
 
   final String title;
   final List<String> options;
+  final int? imageId;
+  final String? imageUrl;
+  final String? filename;
+
+  bool get isImage => imageUrl != null;
 }
 
 class _StatusChip extends StatelessWidget {
@@ -791,36 +1487,6 @@ class _StatusChip extends StatelessWidget {
           Text(
             label,
             style: TextStyle(color: color, fontWeight: FontWeight.w700),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _Metric extends StatelessWidget {
-  const _Metric({
-    required this.label,
-    required this.value,
-    required this.color,
-  });
-
-  final String label;
-  final String value;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        children: [
-          Expanded(
-            child: Text(label, style: const TextStyle(color: Colors.white60)),
-          ),
-          Text(
-            value,
-            style: TextStyle(color: color, fontWeight: FontWeight.w800),
           ),
         ],
       ),
