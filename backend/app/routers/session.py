@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from jose import JWTError
@@ -22,6 +21,12 @@ from ..state import manager, store_side_frame
 router = APIRouter(prefix="/session", tags=["session"])
 logger = logging.getLogger(__name__)
 QUESTION_IMAGE_DIR = Path(__file__).resolve().parents[2] / "uploads" / "question_images"
+
+
+def _cv2():
+    import cv2
+
+    return cv2
 
 
 def _risk(score: float) -> str:
@@ -171,6 +176,7 @@ async def start_session(
     db.commit()
     db.refresh(session)
 
+    cv2 = _cv2()
     encoded_ok, side_buffer = cv2.imencode(
         ".jpg",
         side_camera_frame,
@@ -259,6 +265,7 @@ def _media_user(token: str, db: Session) -> User:
 
 
 def _encode_frame(frame):
+    cv2 = _cv2()
     ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     return buffer.tobytes() if ok else None
 

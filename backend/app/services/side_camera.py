@@ -6,12 +6,20 @@ import threading
 import time
 from urllib.parse import urlparse
 
-import cv2
-
 _readers: dict[str, "IPCameraReader"] = {}
 _readers_lock = threading.Lock()
 _fresh_frame_seconds = 2.5
 logger = logging.getLogger(__name__)
+_cv2_module = None
+
+
+def _cv2():
+    global _cv2_module
+    if _cv2_module is None:
+        import cv2
+
+        _cv2_module = cv2
+    return _cv2_module
 
 
 def detect_stream_type(camera_url: str) -> str:
@@ -137,6 +145,7 @@ class IPCameraReader:
             logger.info("Side camera capture closed for reconnect; url=%s", self.url)
 
     def _open_capture(self):
+        cv2 = _cv2()
         try:
             capture = cv2.VideoCapture(self.url)
         except Exception:

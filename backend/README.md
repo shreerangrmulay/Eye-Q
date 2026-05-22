@@ -32,3 +32,15 @@ Demo logins:
 ## Render
 
 Use this folder as the Render root, or use `backend/render.yaml` as the blueprint.
+
+Render startup keeps the camera and AI stack lazy. OpenCV is imported when a
+camera route needs it, while Ultralytics and MediaPipe are imported when a
+session processes its first AI frame. YOLO writes its config under `/tmp` and
+the default model lookup only falls back to the bundled `models/yolov8n.pt`
+nano weights unless `YOLO_MODEL_PATH` is explicitly configured.
+
+The Render blueprint pins the lower-memory processing defaults:
+
+- `AI_FRAME_WIDTH=480`
+- `AI_YOLO_IMAGE_SIZE=480`
+- `AI_YOLO_MIN_INTERVAL_SECONDS=0.5`

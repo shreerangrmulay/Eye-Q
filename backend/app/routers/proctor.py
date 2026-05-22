@@ -1,7 +1,5 @@
 import json
 
-import cv2
-import numpy as np
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
@@ -21,6 +19,19 @@ from ..state import clear_side_frame, manager, store_frame, store_side_frame
 
 router = APIRouter(prefix="/proctor", tags=["proctor"])
 side_camera_failures: dict[str, int] = {}
+
+
+def _cv2():
+    import cv2
+
+    return cv2
+
+
+def _decode_frame(contents: bytes):
+    import numpy as np
+
+    cv2 = _cv2()
+    return cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
 
 
 def _risk(score: float) -> str:
@@ -71,6 +82,7 @@ async def validate_side_camera(
             state="STREAM_FAILED",
         )
 
+    cv2 = _cv2()
     encoded_ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     if not encoded_ok or not buffer.any():
         return SideCameraValidationResponse(
@@ -120,6 +132,7 @@ async def reconnect_side_camera(
     side_camera_failures[session_id] = 0
     ok, side_frame = read_side_camera_frame(validation.resolved_url or validation.side_camera_url, timeout_seconds=2.0)
     if ok:
+        cv2 = _cv2()
         encoded_ok, side_buffer = cv2.imencode(".jpg", side_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         store_side_frame(session_id, side_buffer.tobytes() if encoded_ok else b"")
     db.commit()
@@ -146,10 +159,11 @@ async def upload_frame(
         raise HTTPException(status_code=409, detail="Session already closed")
 
     contents = await file.read()
-    frame = cv2.imdecode(np.frombuffer(contents, np.uint8), cv2.IMREAD_COLOR)
+    frame = _decode_frame(contents)
     if frame is None:
         raise HTTPException(status_code=400, detail="Invalid image")
 
+    cv2 = _cv2()
     detection = ai_service.process_frame(session_id, frame, camera="front")
     store_frame(session_id, contents, detection.annotated_jpeg)
     side_events = []
@@ -310,6 +324,7 @@ async def check_side_camera(
 
     ok, side_frame = read_side_camera_frame(session.side_camera_url, timeout_seconds=1.25)
     if ok:
+        cv2 = _cv2()
         side_camera_failures[session_id] = 0
         encoded_ok, side_buffer = cv2.imencode(".jpg", side_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         side_detection = ai_service.process_frame(f"{session_id}:side", side_frame, camera="side")

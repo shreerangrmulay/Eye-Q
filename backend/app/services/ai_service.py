@@ -1,24 +1,30 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
-import cv2
-import numpy as np
+logger = logging.getLogger(__name__)
 
-try:
-    from ultralytics import YOLO
-except Exception:
-    YOLO = None
 
-try:
-    import mediapipe as mp
-except Exception:
-    mp = None
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, min(value, maximum))
 
 
 @dataclass
@@ -35,53 +41,31 @@ class Detection:
 class AIProctorService:
     def __init__(self):
         self._lock = threading.Lock()
-        self._model = None
-        self._hands = None
-        self._previous_gray: Dict[str, np.ndarray] = {}
+        self._cv2: Any | None = None
+        self._np: Any | None = None
+        self._model: Any | None = None
+        self._model_checked = False
+        self._hands: Any | None = None
+        self._hands_checked = False
+        self._face_cascade: Any | None = None
+        self._previous_gray: Dict[str, Any] = {}
         self._last_charged_event_at: Dict[str, float] = {}
-        self._face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        self._load_models()
+        self._last_yolo_run_at: Dict[str, float] = {}
+        self._last_yolo_result: Dict[str, Tuple[int, int, List[str]]] = {}
+        self._frame_width = _env_int("AI_FRAME_WIDTH", 480, 320, 1280)
+        self._yolo_image_size = _env_int("AI_YOLO_IMAGE_SIZE", 480, 320, 1280)
+        self._yolo_min_interval = _env_float("AI_YOLO_MIN_INTERVAL_SECONDS", 0.5, 0.0, 10.0)
 
-    def _load_models(self):
-        if YOLO is not None:
-            model_path = os.getenv("YOLO_MODEL_PATH")
-            candidates = [
-                Path(model_path) if model_path else None,
-                Path.cwd() / "models" / "yolov8s.pt",
-                Path.cwd() / "models" / "yolov8n.pt",
-                Path.cwd() / "yolov8s.pt",
-                Path.cwd().parent / "yolov8s.pt",
-                Path.cwd().parent / "yolov8n.pt",
-            ]
-            for candidate in candidates:
-                if candidate and candidate.exists():
-                    try:
-                        self._model = YOLO(str(candidate))
-                        break
-                    except Exception:
-                        self._model = None
-
-        if mp is not None:
-            try:
-                self._hands = mp.solutions.hands.Hands(
-                    static_image_mode=True,
-                    max_num_hands=2,
-                    min_detection_confidence=0.45,
-                )
-            except Exception:
-                self._hands = None
-
-    def process_frame(self, session_id: str, frame: np.ndarray, camera: str = "front") -> Detection:
+    def process_frame(self, session_id: str, frame: Any, camera: str = "front") -> Detection:
         if frame is None:
             return Detection(False, "Invalid camera frame")
 
+        cv2 = self._get_cv2()
         resized = self._resize(frame)
         annotated = resized.copy()
         events: List[Dict] = []
 
-        persons, phones, objects = self._detect_yolo(resized)
+        persons, phones, objects = self._detect_yolo(session_id, camera, resized)
         hand_count = self._detect_hands(resized)
         face_count = self._detect_faces(resized)
         movement_score = self._movement_score(session_id, resized)
@@ -146,20 +130,119 @@ class AIProctorService:
             annotated_jpeg=buffer.tobytes() if ok else None,
         )
 
-    def _resize(self, frame: np.ndarray) -> np.ndarray:
+    def _get_cv2(self):
+        if self._cv2 is None:
+            import cv2
+
+            self._cv2 = cv2
+        return self._cv2
+
+    def _get_numpy(self):
+        if self._np is None:
+            import numpy as np
+
+            self._np = np
+        return self._np
+
+    def _get_model(self):
+        if self._model_checked:
+            return self._model
+
+        with self._lock:
+            if self._model_checked:
+                return self._model
+
+            self._model_checked = True
+            os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp")
+            try:
+                from ultralytics import YOLO
+            except Exception:
+                logger.exception("Ultralytics unavailable; YOLO detection disabled until backend restart")
+                return None
+
+            for candidate in self._model_candidates():
+                if not candidate.exists():
+                    continue
+                try:
+                    logger.info("Loading YOLO model on first AI frame; path=%s", candidate)
+                    self._model = YOLO(str(candidate))
+                    break
+                except Exception:
+                    logger.exception("YOLO model load failed; path=%s", candidate)
+                    self._model = None
+        return self._model
+
+    def _model_candidates(self) -> List[Path]:
+        configured_model = os.getenv("YOLO_MODEL_PATH")
+        backend_dir = Path(__file__).resolve().parents[2]
+        candidates = [
+            Path(configured_model) if configured_model else None,
+            backend_dir / "models" / "yolov8n.pt",
+            Path.cwd() / "models" / "yolov8n.pt",
+            Path.cwd() / "yolov8n.pt",
+            Path.cwd().parent / "models" / "yolov8n.pt",
+            Path.cwd().parent / "yolov8n.pt",
+        ]
+        return [candidate for candidate in candidates if candidate is not None]
+
+    def _get_hands(self):
+        if self._hands_checked:
+            return self._hands
+
+        with self._lock:
+            if self._hands_checked:
+                return self._hands
+
+            self._hands_checked = True
+            try:
+                import mediapipe as mp
+
+                self._hands = mp.solutions.hands.Hands(
+                    static_image_mode=True,
+                    max_num_hands=2,
+                    min_detection_confidence=0.45,
+                )
+            except Exception:
+                logger.exception("MediaPipe hand detection unavailable until backend restart")
+                self._hands = None
+        return self._hands
+
+    def _get_face_cascade(self):
+        if self._face_cascade is None:
+            cv2 = self._get_cv2()
+            self._face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            )
+        return self._face_cascade
+
+    def _resize(self, frame: Any):
+        cv2 = self._get_cv2()
         h, w = frame.shape[:2]
-        target_width = 640
+        target_width = self._frame_width
         if w <= target_width:
             return frame
         scale = target_width / float(w)
         return cv2.resize(frame, (target_width, int(h * scale)))
 
-    def _detect_yolo(self, frame: np.ndarray) -> Tuple[int, int, List[str]]:
-        if self._model is None:
-            return 1, 0, []
+    def _detect_yolo(self, session_id: str, camera: str, frame: Any) -> Tuple[int, int, List[str]]:
+        cache_key = f"{session_id}:{camera}"
+        now = time.monotonic()
+        cached = self._last_yolo_result.get(cache_key)
+        last_run = self._last_yolo_run_at.get(cache_key, 0.0)
+        if cached is not None and now - last_run < self._yolo_min_interval:
+            return cached
+
+        model = self._get_model()
+        if model is None:
+            return cached or (1, 0, [])
 
         with self._lock:
-            results = self._model.predict(frame, verbose=False, conf=0.35, imgsz=640)
+            results = model.predict(
+                frame,
+                verbose=False,
+                conf=0.35,
+                imgsz=self._yolo_image_size,
+            )
 
         persons = 0
         phones = 0
@@ -177,21 +260,34 @@ class AIProctorService:
                     phones += 1
                 elif name in suspicious_names:
                     objects.append(name)
-        return persons, phones, objects
+        detection = (persons, phones, objects)
+        self._last_yolo_run_at[cache_key] = time.monotonic()
+        self._last_yolo_result[cache_key] = detection
+        return detection
 
-    def _detect_hands(self, frame: np.ndarray) -> int:
-        if self._hands is None:
+    def _detect_hands(self, frame: Any) -> int:
+        hands = self._get_hands()
+        if hands is None:
             return 0
+        cv2 = self._get_cv2()
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        result = self._hands.process(rgb)
+        result = hands.process(rgb)
         return len(result.multi_hand_landmarks or [])
 
-    def _detect_faces(self, frame: np.ndarray) -> int:
+    def _detect_faces(self, frame: Any) -> int:
+        cv2 = self._get_cv2()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self._face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+        faces = self._get_face_cascade().detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(40, 40),
+        )
         return len(faces)
 
-    def _movement_score(self, session_id: str, frame: np.ndarray) -> float:
+    def _movement_score(self, session_id: str, frame: Any) -> float:
+        cv2 = self._get_cv2()
+        np = self._get_numpy()
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (21, 21), 0)
         previous = self._previous_gray.get(session_id)

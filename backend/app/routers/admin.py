@@ -5,7 +5,6 @@ import time
 import uuid
 from pathlib import Path
 
-import cv2
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, StreamingResponse
 from jose import JWTError
@@ -30,6 +29,12 @@ router = APIRouter(tags=["admin"])
 logger = logging.getLogger(__name__)
 QUESTION_IMAGE_DIR = Path(__file__).resolve().parents[2] / "uploads" / "question_images"
 ALLOWED_QUESTION_IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg"}
+
+
+def _cv2():
+    import cv2
+
+    return cv2
 
 
 def _current_session_filter():
@@ -312,6 +317,7 @@ def snapshot(session_id: str):
 
 
 def _encode_frame(frame):
+    cv2 = _cv2()
     ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     return buffer.tobytes() if ok else None
 
