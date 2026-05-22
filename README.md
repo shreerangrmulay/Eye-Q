@@ -25,7 +25,7 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 Terminal 2:
@@ -33,8 +33,11 @@ Terminal 2:
 ```powershell
 cd edi_project
 flutter pub get
-flutter run -d chrome --dart-define=API_URL=http://127.0.0.1:8000
+flutter run -d chrome
 ```
+
+Flutter debug builds use the local backend by default. Override the backend for
+web builds with `--dart-define=API_BASE_URL=<backend-url>` when needed.
 
 Demo users:
 

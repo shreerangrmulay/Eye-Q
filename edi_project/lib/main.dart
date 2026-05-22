@@ -6,10 +6,12 @@ import 'profile_screen.dart';
 import 'auth_screen.dart';
 import 'student_panel.dart';
 import 'admin_panel.dart';
+import 'api_config.dart';
 import 'design_system.dart';
 import 'teacher_dashboard.dart';
 
 void main() {
+  ApiConfig.logSelectedBackend();
   runApp(const ProctorSystemApp());
 }
 
@@ -59,7 +61,10 @@ class ProctorSystemApp extends StatelessWidget {
           inputDecorationTheme: InputDecorationTheme(
             filled: true,
             fillColor: const Color(0xAA111827),
-            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(18),
               borderSide: const BorderSide(color: AiColors.border),
@@ -75,13 +80,17 @@ class ProctorSystemApp extends StatelessWidget {
           ),
           filledButtonTheme: FilledButtonThemeData(
             style: FilledButton.styleFrom(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             ),
           ),
           outlinedButtonTheme: OutlinedButtonThemeData(
             style: OutlinedButton.styleFrom(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
               side: const BorderSide(color: AiColors.border),
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
             ),

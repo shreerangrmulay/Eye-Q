@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 
+import 'api_config.dart';
+
 class ApiException implements Exception {
   final String message;
   final int? statusCode;
@@ -41,10 +43,7 @@ class ApiDownload {
 class ApiService {
   ApiService({this.token});
 
-  static const String baseUrl = String.fromEnvironment(
-    'API_URL',
-    defaultValue: 'http://localhost:8000',
-  );
+  static String get baseUrl => ApiConfig.baseUrl;
 
   final String? token;
 
@@ -155,7 +154,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getStudentProfile() async {
-    final response = await http.get(_uri('/student/profile'), headers: _headers);
+    final response = await http.get(
+      _uri('/student/profile'),
+      headers: _headers,
+    );
     return _decodeMap(response);
   }
 
@@ -188,7 +190,10 @@ class ApiService {
   }
 
   Future<Map<String, dynamic>> getTeacherSummary() async {
-    final response = await http.get(_uri('/teacher/summary'), headers: _headers);
+    final response = await http.get(
+      _uri('/teacher/summary'),
+      headers: _headers,
+    );
     return _decodeMap(response);
   }
 
@@ -208,7 +213,9 @@ class ApiService {
     return _decodeList(response);
   }
 
-  Future<Map<String, dynamic>> createTeacherSubject(Map<String, dynamic> payload) async {
+  Future<Map<String, dynamic>> createTeacherSubject(
+    Map<String, dynamic> payload,
+  ) async {
     final response = await http.post(
       _uri('/teacher/subjects'),
       headers: _headers,
@@ -217,7 +224,10 @@ class ApiService {
     return _decodeMap(response);
   }
 
-  Future<Map<String, dynamic>> updateTeacherSubject(int subjectId, Map<String, dynamic> payload) async {
+  Future<Map<String, dynamic>> updateTeacherSubject(
+    int subjectId,
+    Map<String, dynamic> payload,
+  ) async {
     final response = await http.put(
       _uri('/teacher/subjects/$subjectId'),
       headers: _headers,
@@ -244,7 +254,9 @@ class ApiService {
     return _decodeList(response);
   }
 
-  Future<Map<String, dynamic>> createTeacherExam(Map<String, dynamic> payload) async {
+  Future<Map<String, dynamic>> createTeacherExam(
+    Map<String, dynamic> payload,
+  ) async {
     final response = await http.post(
       _uri('/teacher/exams'),
       headers: _headers,
@@ -253,7 +265,10 @@ class ApiService {
     return _decodeMap(response);
   }
 
-  Future<Map<String, dynamic>> updateTeacherExam(int examId, Map<String, dynamic> payload) async {
+  Future<Map<String, dynamic>> updateTeacherExam(
+    int examId,
+    Map<String, dynamic> payload,
+  ) async {
     final response = await http.put(
       _uri('/teacher/exams/$examId'),
       headers: _headers,
@@ -270,7 +285,9 @@ class ApiService {
     return _decodeMap(response);
   }
 
-  Future<List<Map<String, dynamic>>> getTeacherQuestionImages(int examId) async {
+  Future<List<Map<String, dynamic>>> getTeacherQuestionImages(
+    int examId,
+  ) async {
     final response = await http.get(
       _uri('/teacher/exams/$examId/question-images'),
       headers: _headers,
@@ -639,9 +656,9 @@ class ApiService {
       if (search != null && search.isNotEmpty) 'search': search,
       if (token != null && token!.isNotEmpty) 'token': token!,
     };
-    return Uri.parse('$baseUrl/teacher/results/export')
-        .replace(queryParameters: query)
-        .toString();
+    return Uri.parse(
+      '$baseUrl/teacher/results/export',
+    ).replace(queryParameters: query).toString();
   }
 
   String adminWebSocketUrl() => _ws('/ws/admin');
@@ -649,16 +666,10 @@ class ApiService {
   String sessionWebSocketUrl(String sessionId) => _ws('/ws/session/$sessionId');
 
   String _ws(String path) {
-    final base = Uri.parse(baseUrl);
-    final scheme = base.scheme == 'https' ? 'wss' : 'ws';
-    final uri = base.replace(
-      scheme: scheme,
-      path: path,
-      queryParameters: {
-        if (token != null && token!.isNotEmpty) 'token': token!,
-      },
+    return ApiConfig.webSocketUrl(
+      path,
+      token: token != null && token!.isNotEmpty ? token : null,
     );
-    return uri.toString();
   }
 
   Map<String, dynamic> _decodeMap(http.Response response) {
